@@ -1,6 +1,6 @@
-Flask3.0.0
-Werkzeug3.0.1
-openpyxl3.1.2
-reportlab4.0.7
-Pillow10.1.0
-qrcode7.4.2
+Flask>=3.0.0
+Werkzeug>=3.0.1
+openpyxl>=3.1.2
+reportlab>=4.0.7
+Pillow>=10.1.0
+qrcode>=7.4.2
