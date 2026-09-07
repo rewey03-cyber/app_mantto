@@ -2,6 +2,9 @@ import sqlite3
 import os
 import io
 import base64
+import hmac
+import hashlib
+import subprocess
 from flask import Flask, jsonify, render_template_string, request, Response, send_file, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
@@ -44,7 +47,6 @@ except ImportError:
     exit(1)
 
 # --- CONFIGURACIÓN DE RUTAS ABSOLUTAS (PARA EL SERVIDOR EN LA NUBE) ---
-# Esto garantiza que el servidor siempre encuentre tu BD y tu logo sin importar la carpeta
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_NAME = os.path.join(BASE_DIR, "cmms_planta_cafe.db")
 
@@ -53,13 +55,47 @@ app = Flask(__name__)
 # Llave secreta necesaria para mantener las sesiones de usuario seguras
 app.secret_key = 'cafetec_super_secret_enterprise_key'
 
+# --- CONTRASEÑA SECRETA PARA GITHUB (WEBHOOK) ---
+GITHUB_SECRET = 'cafetec_github_2026_seguro'
+
 @app.before_request
 def requerir_login():
-    """Protege todas las rutas del sistema, excepto el login y archivos estáticos."""
-    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'vista_movil_maquina']
-    # Permitimos ver la etiqueta QR y la vista móvil si alguien escanea
+    """Protege todas las rutas del sistema, excepto el login, QR, vista móvil y Webhook de GitHub."""
+    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'vista_movil_maquina', 'webhook_update']
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
         return redirect(url_for('login'))
+
+# ==========================================
+# 0. CI/CD: WEBHOOK DE GITHUB (AUTOMATIZACIÓN)
+# ==========================================
+
+@app.route('/webhook-update', methods=['POST'])
+def webhook_update():
+    """Endpoint automático para actualizar la app en PythonAnywhere al hacer push a GitHub."""
+    signature = request.headers.get('X-Hub-Signature-256')
+    if not signature:
+        return jsonify({'msg': 'Firma de seguridad ausente'}), 403
+        
+    sha_name, signature = signature.split('=')
+    if sha_name != 'sha256':
+        return jsonify({'msg': 'Algoritmo no soportado'}), 501
+
+    mac = hmac.new(GITHUB_SECRET.encode(), msg=request.data, digestmod=hashlib.sha256)
+    if not hmac.compare_digest(mac.hexdigest(), signature):
+        return jsonify({'msg': 'Firma secreta inválida'}), 403
+
+    try:
+        subprocess.run(['git', 'fetch', '--all'], cwd=BASE_DIR, check=True)
+        subprocess.run(['git', 'reset', '--hard', 'origin/main'], cwd=BASE_DIR, check=True)
+        
+        # Tocar el archivo WSGI para reiniciar automáticamente el servidor en PythonAnywhere
+        wsgi_path = '/var/www/rewey_pythonanywhere_com_wsgi.py'
+        if os.path.exists(wsgi_path):
+            os.utime(wsgi_path, None)
+
+        return jsonify({'msg': '¡Actualización y reinicio automático completados!'}), 200
+    except Exception as e:
+        return jsonify({'msg': f'Error en despliegue: {str(e)}'}), 500
 
 # ==========================================
 # 1. CAPA DE ACCESO A DATOS (CRUD BÁSICO Y AVANZADO)
@@ -89,10 +125,10 @@ def migrar_base_datos():
     cursor.execute("SELECT COUNT(*) FROM Usuarios")
     if cursor.fetchone()[0] == 0:
         usuarios_defecto = [
-            ('admin', generate_password_hash('Cafetec_Admin2026*'), 'Administrador Principal', 'Admin'),
-            ('tecnico1', generate_password_hash('Cafe_Tecnico2026*'), 'Juan Pérez (Téc. Mecánico)', 'Tecnico'),
-            ('tecnico2', generate_password_hash('Cafe_Tecnico2026*'), 'Carlos Gomez (Téc. Eléctrico)', 'Tecnico'),
-            ('tecnico3', generate_password_hash('Cafe_Tecnico2026*'), 'Ana Silva (Téc. Instrumentación)', 'Tecnico')
+            ('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'),
+            ('tecnico1', generate_password_hash('tec123'), 'Juan Pérez (Téc. Mecánico)', 'Tecnico'),
+            ('tecnico2', generate_password_hash('tec123'), 'Carlos Gomez (Téc. Eléctrico)', 'Tecnico'),
+            ('tecnico3', generate_password_hash('tec123'), 'Ana Silva (Téc. Instrumentación)', 'Tecnico')
         ]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
 
@@ -163,7 +199,6 @@ def migrar_base_datos():
         pass 
         
     try:
-        # Tabla para las evidencias fotográficas del reporte
         conn.execute("""
             CREATE TABLE IF NOT EXISTS Evidencia_Fotografica (
                 id_evidencia INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +211,6 @@ def migrar_base_datos():
         pass
         
     try:
-        # Tabla para el libro de compras contable
         conn.execute("""
             CREATE TABLE IF NOT EXISTS Compras_Repuestos (
                 id_compra INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +233,6 @@ def obtener_todas_las_maquinas():
     conn = get_db_connection()
     hoy = datetime.now().strftime('%Y-%m-%d')
     
-    # LOGICA TIME-AWARE
     conn.execute(f"""
         UPDATE Maquinas 
         SET estado = 'En Mantenimiento' 
@@ -322,7 +355,6 @@ def eliminar_orden_db(id_orden):
     conn.close()
 
 def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, equipos, tiempo, evidencias=[]):
-    """Marca una orden como completada, guarda los detalles del reporte, descuenta stock y guarda fotos."""
     conn = get_db_connection()
     hoy = datetime.now().strftime('%Y-%m-%d')
     try:
@@ -357,7 +389,6 @@ def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, e
                 WHERE id_repuesto = ?
             ''', (cantidad, id_rep))
             
-        # Guardar evidencias fotográficas procesadas en la interfaz
         for b64 in evidencias:
             conn.execute('''
                 INSERT INTO Evidencia_Fotografica (id_mantenimiento, imagen_base64)
@@ -420,7 +451,6 @@ LOGIN_TEMPLATE = """
     </style>
 </head>
 <body class="bg-[#050f1a] flex items-center justify-center h-screen relative overflow-hidden">
-    <!-- Decoración de fondo corporativo -->
     <div class="absolute top-[-10%] left-[-10%] w-96 h-96 bg-cyan-600 rounded-full mix-blend-multiply filter blur-[128px] opacity-20 animate-blob"></div>
     <div class="absolute bottom-[-10%] right-[-10%] w-96 h-96 bg-blue-600 rounded-full mix-blend-multiply filter blur-[128px] opacity-20 animate-blob animation-delay-2000"></div>
 
@@ -480,17 +510,12 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cafetec - Sistema de Mantenimiento</title>
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = { darkMode: 'class', theme: { extend: {} } }
     </script>
-    <!-- FontAwesome Icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
-    <!-- Google Fonts: Inter para textos y Rajdhani para el Logotipo Industrial -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
@@ -498,29 +523,23 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
-        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
-        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
-        
-        /* Ocultar flechas de inputs numéricos */
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
 </head>
 <body class="bg-slate-50 dark:bg-slate-950 antialiased text-slate-800 dark:text-slate-200 relative transition-colors duration-300">
 
-    <!-- Variables Globales desde Flask (Autorización) -->
     <script>
         const CURRENT_USER = "{{ session.get('nombre_completo', 'Usuario') }}";
         const CURRENT_ROLE = "{{ session.get('rol', 'Tecnico') }}";
     </script>
 
-    <!-- Notificación Flotante Personalizada -->
     <div id="toast-notificacion" class="fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform translate-x-[150%] transition-transform duration-300 z-[100] border-l-4 border-cyan-500 font-bold flex items-center">
         <i id="toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="toast-msg">Mensaje</span>
@@ -543,17 +562,14 @@ HTML_TEMPLATE = """
                 </div>
                 
                 <div class="flex items-center space-x-4">
-                    <!-- BOTÓN MONITOR -->
                     <a href="/monitor" target="_blank" class="hidden sm:flex text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg items-center shadow-inner font-bold text-xs" title="Abrir Monitor de Planta">
                         <i class="fa-solid fa-display mr-2"></i> Monitor
                     </a>
 
-                    <!-- Botón Tema Oscuro/Claro -->
                     <button onclick="toggleTheme()" class="text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 p-2.5 rounded-full w-10 h-10 flex justify-center items-center shadow-inner" title="Cambiar Tema">
                         <i id="theme-icon" class="fa-solid fa-sun"></i>
                     </button>
 
-                    <!-- Panel de Usuario y Logout -->
                     <div class="text-sm font-medium bg-slate-900 pl-4 pr-2 py-1.5 rounded-full border border-slate-800 shadow-inner flex items-center text-slate-200">
                         <div class="flex flex-col text-right mr-3 leading-tight hidden sm:flex">
                             <span class="font-bold text-white text-[11px]">{{ session.get('nombre_completo', 'Usuario') }}</span>
@@ -574,7 +590,7 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
-        <!-- Tarjetas de Resumen (KPIs) - ESTILO COMPACTO -->
+        <!-- Tarjetas de Resumen (KPIs) -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
                 <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
@@ -616,7 +632,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Gráficos de Estado (Chart.js) COMPACTOS -->
+        <!-- Gráficos de Estado -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
                 <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
@@ -1744,7 +1760,6 @@ MONITOR_TEMPLATE = """
     </main>
 
     <script>
-        // Reloj
         function actualizarReloj() {
             const ahora = new Date();
             document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
@@ -1862,7 +1877,6 @@ MOBILE_MACHINE_TEMPLATE = """
     </header>
 
     <div class="p-4 space-y-4">
-        <!-- Tarjeta Principal -->
         <div class="bg-slate-900 rounded-2xl p-5 border border-slate-800 shadow-xl relative overflow-hidden">
             {% if maquina.estado == 'Operativa' %}
                 <div class="absolute left-0 top-0 bottom-0 w-1.5 bg-emerald-500"></div>
@@ -1889,7 +1903,6 @@ MOBILE_MACHINE_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Acciones Rápidas -->
         <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-2 ml-1">Acciones Rápidas</h2>
         <div class="grid grid-cols-2 gap-3">
             <a href="/" class="bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl p-4 font-bold flex flex-col items-center justify-center text-center shadow-lg transition-colors">
@@ -1942,14 +1955,10 @@ def dashboard():
 
 @app.route('/monitor')
 def monitor():
-    """Ruta para la pantalla de Monitor de Planta en TV."""
     return render_template_string(MONITOR_TEMPLATE)
-
-# --- NUEVAS RUTAS PARA EL MÓDULO QR ---
 
 @app.route('/maquina/<int:id_maquina>')
 def vista_movil_maquina(id_maquina):
-    """Vista optimizada para el técnico en planta tras escanear el QR."""
     conn = get_db_connection()
     maquina = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
     conn.close()
@@ -1958,7 +1967,6 @@ def vista_movil_maquina(id_maquina):
 
 @app.route('/api/maquinas/etiqueta/<int:id_maquina>')
 def api_etiqueta_qr(id_maquina):
-    """Genera la etiqueta HTML con el QR embebido lista para imprimir."""
     conn = get_db_connection()
     m = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
     conn.close()
@@ -1966,13 +1974,11 @@ def api_etiqueta_qr(id_maquina):
     
     url_maquina = request.host_url.rstrip('/') + url_for('vista_movil_maquina', id_maquina=id_maquina)
     
-    # Generar QR
     qr = qrcode.QRCode(version=1, box_size=10, border=1)
     qr.add_data(url_maquina)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     
-    # Convertir a Base64 para HTML
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -2017,8 +2023,6 @@ def api_etiqueta_qr(id_maquina):
     </html>
     """
     return render_template_string(ETIQUETA_HTML, m=m, qr_img=img_str)
-
-# ----------------------------------------------------
 
 @app.route('/api/monitor_data')
 def api_monitor_data():
@@ -2216,9 +2220,7 @@ def api_descargar_reporte(id_orden):
     """
     orden = conn.execute(query, (id_orden,)).fetchone()
     
-    # Extraer las evidencias fotográficas asociadas
     evidencias_db = conn.execute("SELECT imagen_base64 FROM Evidencia_Fotografica WHERE id_mantenimiento = ?", (id_orden,)).fetchall()
-    
     conn.close()
 
     if not orden: return "Orden no encontrada", 404
@@ -2227,7 +2229,6 @@ def api_descargar_reporte(id_orden):
     doc = SimpleDocTemplate(file_stream, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
     elements = []
     
-    # ------------------ ESTILOS GENERALES ------------------
     title_style = ParagraphStyle(
         name='Title',
         fontName='Helvetica-Bold',
@@ -2244,25 +2245,18 @@ def api_descargar_reporte(id_orden):
         leading=14
     )
 
-    # ------------------ CABECERA (TABLA FORMATO RE-MAN-262) ------------------
     logo_path = os.path.join(BASE_DIR, "logo_cafetec.jpg")
     if os.path.exists(logo_path):
-        # Usamos kind='proportional' para que encaje perfecto sin deformarse dentro de su fondo negro
-        # Aumentamos el tamaño al máximo permitido por los márgenes internos de la celda (112x55)
         celda_logo = Image(logo_path, width=112, height=55, kind='proportional')
     else:
         celda_logo = Paragraph("<font color='white'><b>CAFETEC</b></font>", ParagraphStyle(name='LogoFB', alignment=1, fontName='Times-Bold', fontSize=14))
 
-    # Fuentes Serifadas para respetar la plantilla corporativa
     p_tit_top = Paragraph("REGISTRO DE MANTENIMIENTO", ParagraphStyle(name='TitTop', alignment=1, fontName='Times-Bold', fontSize=11, leading=14))
-    
-    # Nombre de máquina con el leve color azul corporativo detectado
     p_tit_bot = Paragraph(f"MANTENIMIENTO DE MAQUINA {orden['maquina_nombre'].upper()}", ParagraphStyle(name='TitBot', alignment=1, fontName='Times-Bold', fontSize=10, textColor=colors.HexColor('#004b87'), leading=12)) 
     
     lbl_style = ParagraphStyle(name='Lbl', alignment=0, fontName='Times-Roman', fontSize=10)
     val_style = ParagraphStyle(name='Val', alignment=0, fontName='Times-Roman', fontSize=10)
 
-    # Convertir YYYY-MM-DD a formato corto DD/MM/YY
     fecha_format = orden['fecha_ejecucion']
     try:
         f_obj = datetime.strptime(fecha_format, '%Y-%m-%d')
@@ -2270,7 +2264,6 @@ def api_descargar_reporte(id_orden):
     except:
         pass
 
-    # Matriz 4x4
     header_data = [
         [celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph("RE MAN-262", val_style)],
         ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)],
@@ -2280,10 +2273,10 @@ def api_descargar_reporte(id_orden):
     
     t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
     t_header.setStyle(TableStyle([
-        ('SPAN', (0, 0), (0, 3)), # Fusionar 4 filas para el logo
-        ('SPAN', (1, 0), (1, 1)), # Fusionar 2 filas top para Titulo 1
-        ('SPAN', (1, 2), (1, 3)), # Fusionar 2 filas bottom para Titulo 2
-        ('BACKGROUND', (0, 0), (0, 3), colors.black), # Fondo negro riguroso para la celda del logo
+        ('SPAN', (0, 0), (0, 3)),
+        ('SPAN', (1, 0), (1, 1)),
+        ('SPAN', (1, 2), (1, 3)),
+        ('BACKGROUND', (0, 0), (0, 3), colors.black),
         ('ALIGN', (0,0), (-1,-1), 'CENTER'),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('GRID', (0,0), (-1,-1), 1, colors.black),
@@ -2295,9 +2288,6 @@ def api_descargar_reporte(id_orden):
     elements.append(t_header)
     elements.append(Spacer(1, 15))
 
-    # ------------------ SECCIONES DEL DOCUMENTO ------------------
-    
-    # 1. INFORMACION GENERAL
     elements.append(Paragraph("1. INFORMACIÓN GENERAL:", title_style))
     info_text = f"""
     • <b>Fecha de Ejecución:</b> {orden['fecha_ejecucion']}<br/>
@@ -2309,23 +2299,18 @@ def api_descargar_reporte(id_orden):
     """
     elements.append(Paragraph(info_text, normal_style))
 
-    # 2. TRABAJO SOLICITADO
     elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
     elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
 
-    # 3. TRABAJOS REALIZADOS
     elements.append(Paragraph("3. TRABAJOS REALIZADOS:", title_style))
     trabajos = orden['trabajos_realizados'].replace('\n', '<br/>')
     elements.append(Paragraph(trabajos, normal_style))
 
-    # 4. DESCRIPCION / OBSERVACIONES
     elements.append(Paragraph("4. DESCRIPCIÓN Y OBSERVACIONES:", title_style))
     observaciones = orden['observaciones'].replace('\n', '<br/>')
     elements.append(Paragraph(f"• {observaciones}", normal_style))
 
-    # RECURSOS NECESARIOS
     elements.append(Paragraph("RECURSOS NECESARIOS:", title_style))
-    
     rep_text = orden['repuestos_usados'].replace('\n', '<br/>• ') if orden['repuestos_usados'] else "<i>No se utilizaron repuestos de almacén.</i>"
     if orden['repuestos_usados']:
         rep_text = "• " + rep_text
@@ -2341,17 +2326,13 @@ def api_descargar_reporte(id_orden):
     """
     elements.append(Paragraph(recursos_text, normal_style))
 
-    # 5. COMENTARIOS / RECOMENDACIONES
     elements.append(Paragraph("5. COMENTARIOS / RECOMENDACIONES:", title_style))
     recomendaciones = orden['recomendaciones'].replace('\n', '<br/>')
     elements.append(Paragraph(f"• {recomendaciones}", normal_style))
 
-    # 6. EVIDENCIA FOTOGRAFICA
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     
     if evidencias_db:
-        # Configurar el modo de remuestreo de alta calidad de Pillow 
-        # (Compatible con versiones nuevas y antiguas de Pillow)
         try:
             resample_mode = PILImage.Resampling.LANCZOS
         except AttributeError:
@@ -2363,13 +2344,10 @@ def api_descargar_reporte(id_orden):
         for index, row_db in enumerate(evidencias_db):
             try:
                 img_data = base64.b64decode(row_db['imagen_base64'])
-                
-                # Abrir con Pillow y convertir a formato RGB 
                 img_pil = PILImage.open(io.BytesIO(img_data))
                 if img_pil.mode in ('RGBA', 'P'):
                     img_pil = img_pil.convert('RGB')
                 
-                # Recorte Inteligente a Cuadrado Perfecto (Center Crop)
                 width, height = img_pil.size
                 new_size = min(width, height)
                 left = (width - new_size) / 2
@@ -2378,26 +2356,21 @@ def api_descargar_reporte(id_orden):
                 bottom = (height + new_size) / 2
                 img_pil = img_pil.crop((left, top, right, bottom))
                 
-                # Redimensionar para no sobrecargar el peso del PDF final (300x300 px)
                 img_pil = img_pil.resize((300, 300), resample_mode)
                 
-                # Guardar en memoria virtual
                 output = io.BytesIO()
                 img_pil.save(output, format='JPEG', quality=85)
                 output.seek(0)
                 
-                # Crear la imagen para ReportLab a tamaño de 240x240 puntos (ideal para 2 columnas en A4)
                 rl_img = Image(output, width=240, height=240)
                 row.append(rl_img)
                 
-                # Agrupar en pares de 2 columnas
                 if len(row) == 2:
                     evidencia_data.append(row)
                     row = []
             except Exception as e:
                 print(f"Error procesando imagen para el reporte: {e}")
                 
-        # Si quedó una foto impar solita, agregamos una celda vacía para completar la fila
         if row: 
             row.append("")
             evidencia_data.append(row)
@@ -2411,7 +2384,6 @@ def api_descargar_reporte(id_orden):
         ]))
         elements.append(t_evidencia)
     else:
-        # Cuadro vacío por defecto si no subió nada
         box = Table([["\n\n(Espacio reservado para adjuntar evidencia fotográfica post-impresión)\n\n"]], colWidths=[510])
         box.setStyle(TableStyle([
             ('ALIGN', (0,0), (-1,-1), 'CENTER'),
@@ -2422,10 +2394,8 @@ def api_descargar_reporte(id_orden):
         ]))
         elements.append(box)
         
-    # Aumentamos el espaciado vertical antes de las firmas (de 40 a 85 puntos)
     elements.append(Spacer(1, 85))
 
-    # FIRMAS
     firmas_data = [
         ["________________________", "________________________", "________________________"],
         [f"Elaborado:\n{orden['tecnico_asignado']}", "Revisado:\nÁrea de Mantenimiento", "Aprobado:\nGerencia de Planta"]
@@ -2438,7 +2408,6 @@ def api_descargar_reporte(id_orden):
     ]))
     elements.append(t_firmas)
 
-    # CONSTRUIR DOCUMENTO
     doc.build(elements)
     file_stream.seek(0)
     
@@ -2450,7 +2419,4 @@ if __name__ == '__main__':
     print("⚙️  INICIANDO CAFETEC CMMS - ÁREA DE MANTENIMIENTO")
     print("=====================================================")
     migrar_base_datos()
-    print("El servidor está abierto a la red Wi-Fi (si se corre en local).")
-    print("Para conectarte desde el celular usa la dirección IPv4 de tu computadora.")
-    # debug=False es fundamental para seguridad en redes reales
     app.run(host='0.0.0.0', debug=False, port=5000)
