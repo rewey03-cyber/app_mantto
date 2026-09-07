@@ -1,0 +1,6 @@
+Flask3.0.0
+Werkzeug3.0.1
+openpyxl3.1.2
+reportlab4.0.7
+Pillow10.1.0
+qrcode7.4.2
