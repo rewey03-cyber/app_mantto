@@ -1760,6 +1760,7 @@ MONITOR_TEMPLATE = """
     </main>
 
     <script>
+        // Reloj
         function actualizarReloj() {
             const ahora = new Date();
             document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
@@ -1863,20 +1864,34 @@ MOBILE_MACHINE_TEMPLATE = """
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
-    <style>body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }</style>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
+        /* Animaciones para el toast */
+        .toast-enter { transform: translateY(100%); opacity: 0; }
+        .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 0.3s ease-out; }
+    </style>
 </head>
-<body class="pb-20">
+<body class="pb-20 relative">
+
+    <!-- Toast Notification (Mobile) -->
+    <div id="mobile-toast" class="fixed bottom-5 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-3 rounded-xl shadow-2xl border border-slate-700 z-[100] flex items-center w-11/12 max-w-sm toast-enter hidden">
+        <i id="mobile-toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
+        <span id="mobile-toast-msg" class="text-sm font-semibold">Mensaje</span>
+    </div>
+
+    <!-- Header Fijo -->
     <header class="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-50 shadow-lg flex justify-between items-center">
         <div class="flex flex-col">
             <span class="text-cyan-400 font-bold text-sm tracking-widest uppercase">Perfil de Máquina</span>
             <span class="font-black text-2xl text-white">{{ maquina.codigo_equipo }}</span>
         </div>
-        <a href="/" class="bg-slate-800 text-white w-10 h-10 rounded-full flex items-center justify-center shadow-inner">
+        <a href="/" class="bg-slate-800 text-white w-10 h-10 rounded-full flex items-center justify-center shadow-inner border border-slate-700 active:bg-slate-700 transition-colors">
             <i class="fa-solid fa-house"></i>
         </a>
     </header>
 
-    <div class="p-4 space-y-4">
+    <div class="p-4 space-y-6">
+        <!-- Tarjeta Principal de la Máquina -->
         <div class="bg-slate-900 rounded-2xl p-5 border border-slate-800 shadow-xl relative overflow-hidden">
             {% if maquina.estado == 'Operativa' %}
                 <div class="absolute left-0 top-0 bottom-0 w-1.5 bg-emerald-500"></div>
@@ -1889,32 +1904,269 @@ MOBILE_MACHINE_TEMPLATE = """
             
             <div class="grid grid-cols-2 gap-4">
                 <div class="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                    <span class="text-slate-500 text-[10px] uppercase font-bold tracking-wider block">Estado Actual</span>
+                    <span class="text-slate-500 text-[10px] uppercase font-bold tracking-wider block mb-1">Estado Actual</span>
                     {% if maquina.estado == 'Operativa' %}
-                        <span class="text-emerald-400 font-bold text-sm"><i class="fa-solid fa-check-circle mr-1"></i> OPERATIVA</span>
+                        <span class="text-emerald-400 font-black text-sm"><i class="fa-solid fa-check-circle mr-1"></i> OPERATIVA</span>
                     {% else %}
-                        <span class="text-rose-400 font-bold text-sm"><i class="fa-solid fa-triangle-exclamation mr-1"></i> EN MANTENIMIENTO</span>
+                        <span class="text-rose-400 font-black text-sm"><i class="fa-solid fa-triangle-exclamation mr-1"></i> DETENIDA</span>
                     {% endif %}
                 </div>
                 <div class="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                    <span class="text-slate-500 text-[10px] uppercase font-bold tracking-wider block">Criticidad</span>
+                    <span class="text-slate-500 text-[10px] uppercase font-bold tracking-wider block mb-1">Criticidad</span>
                     <span class="text-white font-bold text-sm">{{ maquina.criticidad }}</span>
                 </div>
             </div>
         </div>
 
-        <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-2 ml-1">Acciones Rápidas</h2>
-        <div class="grid grid-cols-2 gap-3">
-            <a href="/" class="bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl p-4 font-bold flex flex-col items-center justify-center text-center shadow-lg transition-colors">
-                <i class="fa-solid fa-clipboard-list text-2xl mb-2"></i>
-                <span class="text-sm">Ver Órdenes</span>
-            </a>
-            <a href="/" class="bg-slate-800 hover:bg-slate-700 text-white rounded-xl p-4 font-bold flex flex-col items-center justify-center text-center shadow-lg border border-slate-700 transition-colors">
-                <i class="fa-solid fa-boxes-stacked text-2xl mb-2 text-cyan-400"></i>
-                <span class="text-sm">Repuestos</span>
-            </a>
+        <!-- Sección: Órdenes Pendientes Activas -->
+        <div>
+            <div class="flex justify-between items-center mb-3 ml-1">
+                <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs flex items-center">
+                    <i class="fa-solid fa-clipboard-list mr-2 text-cyan-500"></i> Tareas Pendientes
+                </h2>
+                <span class="bg-slate-800 text-slate-300 text-[10px] font-bold px-2 py-1 rounded-lg">{{ ordenes|length }}</span>
+            </div>
+            
+            {% if ordenes %}
+                <div class="space-y-3">
+                {% for o in ordenes %}
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-md relative overflow-hidden">
+                        <!-- Barra de color según tipo -->
+                        <div class="absolute left-0 top-0 bottom-0 w-1 {% if o.tipo_mantenimiento == 'Preventivo' %}bg-cyan-500{% elif o.tipo_mantenimiento == 'Correctivo' %}bg-rose-500{% else %}bg-slate-400{% endif %}"></div>
+                        
+                        <div class="pl-2">
+                            <div class="flex justify-between items-start mb-2">
+                                <span class="text-xs font-bold {% if o.tipo_mantenimiento == 'Preventivo' %}text-cyan-400{% elif o.tipo_mantenimiento == 'Correctivo' %}text-rose-400{% else %}text-slate-300{% endif %} uppercase tracking-wider">{{ o.tipo_mantenimiento }}</span>
+                                <span class="text-[10px] font-bold text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20"><i class="fa-regular fa-clock mr-1"></i>{{ o.fecha_programada }}</span>
+                            </div>
+                            <p class="text-sm font-medium text-slate-200 mb-3">{{ o.descripcion_tarea }}</p>
+                            
+                            <!-- Botón para Completar Orden Directamente -->
+                            <button onclick="abrirModalReporteMovel({{ o.id_mantenimiento }})" class="w-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-white font-bold py-2.5 rounded-lg text-sm transition-colors border border-slate-700 flex justify-center items-center shadow-inner">
+                                <i class="fa-solid fa-file-signature mr-2 text-cyan-400"></i> Generar Reporte
+                            </button>
+                        </div>
+                    </div>
+                {% endfor %}
+                </div>
+            {% else %}
+                <div class="bg-slate-900/50 border border-slate-800 border-dashed rounded-xl p-6 text-center">
+                    <i class="fa-solid fa-check-circle text-4xl text-emerald-500/50 mb-2"></i>
+                    <p class="text-slate-500 text-sm font-medium">Equipo al día. No hay tareas programadas.</p>
+                </div>
+            {% endif %}
+        </div>
+
+        <!-- Sección: Historial Reciente (Últimas 3) -->
+        <div>
+            <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-3 ml-1 flex items-center">
+                <i class="fa-solid fa-clock-rotate-left mr-2 text-slate-500"></i> Últimas Intervenciones
+            </h2>
+            
+            {% if historial %}
+                <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-md">
+                    <ul class="divide-y divide-slate-800">
+                    {% for h in historial %}
+                        <li class="p-3">
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-xs font-bold text-slate-300">{{ h.tipo_mantenimiento }}</span>
+                                <span class="text-[10px] text-slate-500">{{ h.fecha_ejecucion }}</span>
+                            </div>
+                            <p class="text-xs text-slate-400 truncate">{{ h.descripcion_tarea }}</p>
+                            <div class="mt-1 flex items-center text-[10px] text-slate-500">
+                                <i class="fa-solid fa-user-tag mr-1 text-slate-600"></i> {{ h.tecnico_asignado }}
+                            </div>
+                        </li>
+                    {% endfor %}
+                    </ul>
+                </div>
+            {% else %}
+                <p class="text-xs text-slate-500 italic ml-1">Sin historial previo registrado.</p>
+            {% endif %}
         </div>
     </div>
+
+    <!-- MODAL MÓVIL: Formulario de Reporte Rápido -->
+    <div id="modal-reporte-movil" class="fixed inset-0 bg-slate-950/90 z-[60] hidden flex-col justify-end transform transition-transform duration-300 translate-y-full">
+        <div class="bg-slate-900 w-full h-[90vh] rounded-t-3xl border-t border-slate-700 flex flex-col shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+            
+            <!-- Handlebar para arrastrar (Visual) -->
+            <div class="w-full flex justify-center py-3" onclick="cerrarModalReporteMovel()">
+                <div class="w-12 h-1.5 bg-slate-700 rounded-full"></div>
+            </div>
+            
+            <div class="px-5 pb-4 border-b border-slate-800 flex justify-between items-center shrink-0">
+                <h3 class="text-lg font-bold text-white flex items-center">
+                    <i class="fa-solid fa-flag-checkered text-emerald-500 mr-2"></i> Finalizar Trabajo
+                </h3>
+                <button onclick="cerrarModalReporteMovel()" class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+            
+            <!-- Contenido Scrollable del Modal -->
+            <div class="p-5 overflow-y-auto flex-1 space-y-4">
+                <input type="hidden" id="movil-id-orden">
+                
+                <div>
+                    <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Trabajos Realizados</label>
+                    <textarea id="movil-trabajos" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="¿Qué se hizo?"></textarea>
+                </div>
+                
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Tiempo (Hrs)</label>
+                        <input type="text" id="movil-tiempo" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Ej: 1.5">
+                    </div>
+                    <div>
+                        <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Equipos Usados</label>
+                        <input type="text" id="movil-equipos" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Herramientas...">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Observaciones / Fallas Encontradas</label>
+                    <textarea id="movil-obs" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Detalles de inspección..."></textarea>
+                </div>
+                
+                <div>
+                    <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Tomar Foto (Evidencia)</label>
+                    <div class="relative">
+                        <input type="file" id="movil-foto" accept="image/*" capture="environment" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" onchange="previewMobileImage(event)">
+                        <div class="w-full bg-slate-950 border-2 border-slate-800 border-dashed rounded-xl p-4 flex flex-col items-center justify-center text-slate-500">
+                            <i class="fa-solid fa-camera text-2xl mb-2 text-cyan-600"></i>
+                            <span class="text-xs font-bold">Abrir Cámara</span>
+                        </div>
+                    </div>
+                    <div id="movil-preview-container" class="mt-3 hidden">
+                        <img id="movil-preview-img" class="w-full h-32 object-cover rounded-xl border border-slate-700">
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Botón Fijo en la parte inferior del Modal -->
+            <div class="p-4 border-t border-slate-800 bg-slate-900 shrink-0">
+                <button onclick="enviarReporteMovil()" id="btn-enviar-movil" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition-colors flex justify-center items-center">
+                    <i class="fa-solid fa-cloud-arrow-up mr-2"></i> Guardar y Completar
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- LÓGICA DE LA VISTA MÓVIL ---
+        let base64FotoMovil = null;
+
+        function showMobileToast(msg, isError = false) {
+            const toast = document.getElementById('mobile-toast');
+            const icon = document.getElementById('mobile-toast-icon');
+            document.getElementById('mobile-toast-msg').innerText = msg;
+            
+            toast.classList.remove('hidden');
+            toast.classList.add('toast-enter-active');
+            
+            if (isError) {
+                toast.classList.replace('bg-slate-800', 'bg-rose-900');
+                toast.classList.replace('border-slate-700', 'border-rose-700');
+                icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
+            } else {
+                toast.classList.replace('bg-rose-900', 'bg-slate-800');
+                toast.classList.replace('border-rose-700', 'border-slate-700');
+                icon.className = "fa-solid fa-circle-check mr-3 text-emerald-400 text-lg";
+            }
+
+            setTimeout(() => {
+                toast.classList.remove('toast-enter-active');
+                setTimeout(() => toast.classList.add('hidden'), 300);
+            }, 3000);
+        }
+
+        function abrirModalReporteMovel(idOrden) {
+            document.getElementById('movil-id-orden').value = idOrden;
+            
+            // Limpiar campos
+            document.getElementById('movil-trabajos').value = '';
+            document.getElementById('movil-tiempo').value = '';
+            document.getElementById('movil-equipos').value = '';
+            document.getElementById('movil-obs').value = '';
+            document.getElementById('movil-foto').value = '';
+            document.getElementById('movil-preview-container').classList.add('hidden');
+            base64FotoMovil = null;
+
+            const modal = document.getElementById('modal-reporte-movil');
+            modal.classList.remove('hidden');
+            // Pequeño delay para la animación de subida
+            setTimeout(() => modal.classList.remove('translate-y-full'), 10);
+        }
+
+        function cerrarModalReporteMovel() {
+            const modal = document.getElementById('modal-reporte-movil');
+            modal.classList.add('translate-y-full');
+            setTimeout(() => modal.classList.add('hidden'), 300);
+        }
+
+        function previewMobileImage(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const b64 = e.target.result;
+                base64FotoMovil = b64.split(',')[1]; // Guardar solo la data pura
+                
+                const img = document.getElementById('movil-preview-img');
+                img.src = b64;
+                document.getElementById('movil-preview-container').classList.remove('hidden');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function enviarReporteMovil() {
+            const idOrden = document.getElementById('movil-id-orden').value;
+            const trabajos = document.getElementById('movil-trabajos').value || 'Trabajo de rutina.';
+            const tiempo = document.getElementById('movil-tiempo').value || '1 h';
+            const equipos = document.getElementById('movil-equipos').value || 'Herramientas estándar.';
+            const obs = document.getElementById('movil-obs').value || 'Sin observaciones.';
+            
+            const btn = document.getElementById('btn-enviar-movil');
+            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Guardando...';
+            btn.disabled = true;
+
+            const payload = {
+                repuestos: [], // En la versión móvil simplificada asumimos sin repuestos para hacerla rápida
+                observaciones: obs,
+                recomendaciones: 'Ninguna registrada desde móvil.',
+                trabajos_realizados: trabajos,
+                equipos_necesarios: equipos,
+                tiempo_ejecucion: tiempo,
+                evidencias: base64FotoMovil ? [base64FotoMovil] : []
+            };
+
+            fetch(`/api/ordenes/completar/${idOrden}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(res => res.json())
+            .then(r => {
+                if(r.status === 'ok') {
+                    showMobileToast('Reporte guardado exitosamente.');
+                    cerrarModalReporteMovel();
+                    // Recargar la página para ver los cambios después de 1 segundo
+                    setTimeout(() => window.location.reload(), 1000);
+                } else {
+                    showMobileToast('Error al guardar reporte.', true);
+                    btn.innerHTML = '<i class="fa-solid fa-cloud-arrow-up mr-2"></i> Intentar de nuevo';
+                    btn.disabled = false;
+                }
+            })
+            .catch(err => {
+                showMobileToast('Error de conexión.', true);
+                btn.innerHTML = '<i class="fa-solid fa-cloud-arrow-up mr-2"></i> Intentar de nuevo';
+                btn.disabled = false;
+            });
+        }
+    </script>
 </body>
 </html>
 """
@@ -1955,15 +2207,46 @@ def dashboard():
 
 @app.route('/monitor')
 def monitor():
+    """Ruta para la pantalla de Monitor de Planta en TV."""
     return render_template_string(MONITOR_TEMPLATE)
+
+# --- NUEVAS RUTAS PARA EL MÓDULO QR ---
 
 @app.route('/maquina/<int:id_maquina>')
 def vista_movil_maquina(id_maquina):
+    """Vista optimizada para el técnico en planta tras escanear el QR."""
     conn = get_db_connection()
+    
+    # 1. Obtener datos de la máquina
     maquina = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
+    if not maquina: 
+        conn.close()
+        return "Máquina no encontrada", 404
+        
+    # 2. Buscar Órdenes Pendientes para ESA máquina
+    ordenes = conn.execute('''
+        SELECT id_mantenimiento, tipo_mantenimiento, descripcion_tarea, fecha_programada 
+        FROM Calendario_Mantenimiento 
+        WHERE id_maquina = ? AND estado_orden IN ('Pendiente', 'En Progreso')
+        ORDER BY fecha_programada ASC
+    ''', (id_maquina,)).fetchall()
+    
+    # 3. Buscar las últimas 3 órdenes completadas (Historial)
+    historial = conn.execute('''
+        SELECT tipo_mantenimiento, descripcion_tarea, fecha_ejecucion, tecnico_asignado 
+        FROM Calendario_Mantenimiento 
+        WHERE id_maquina = ? AND estado_orden = 'Completada'
+        ORDER BY fecha_ejecucion DESC LIMIT 3
+    ''', (id_maquina,)).fetchall()
+    
     conn.close()
-    if not maquina: return "Máquina no encontrada", 404
-    return render_template_string(MOBILE_MACHINE_TEMPLATE, maquina=maquina)
+    
+    # Convertir a diccionarios para Jinja2
+    maquina_dict = dict(maquina)
+    ordenes_list = [dict(o) for o in ordenes]
+    historial_list = [dict(h) for h in historial]
+    
+    return render_template_string(MOBILE_MACHINE_TEMPLATE, maquina=maquina_dict, ordenes=ordenes_list, historial=historial_list)
 
 @app.route('/api/maquinas/etiqueta/<int:id_maquina>')
 def api_etiqueta_qr(id_maquina):
