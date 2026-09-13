@@ -19,7 +19,7 @@ except ImportError:
     print("👉 Ejecuta: pip install openpyxl")
     exit(1)
 
-# --- LIBRERÍA PDF (NUEVO MOTOR DE REPORTES) ---
+# --- LIBRERÍA PDF (MOTOR DE REPORTES) ---
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
@@ -30,7 +30,7 @@ except ImportError:
     print("👉 Ejecuta: pip install reportlab")
     exit(1)
 
-# --- LIBRERÍA PARA PROCESAR IMÁGENES (EVIDENCIA 1:1) ---
+# --- LIBRERÍA PARA PROCESAR IMÁGENES ---
 try:
     from PIL import Image as PILImage
 except ImportError:
@@ -59,20 +59,17 @@ GITHUB_SECRET = 'cafetec_github_2026_seguro'
 
 @app.before_request
 def requerir_login():
-    """Protege todas las rutas del sistema y habilita APIs críticas para la vista móvil."""
-    # NOTA: api_inventario y api_completar_orden están permitidas aquí para que el móvil 
-    # conectado mediante redirección pueda utilizarlas sin ser bloqueado.
-    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update', 'vista_movil_maquina', 'api_inventario', 'api_completar_orden']
+    """Protege todas las rutas del sistema, maneja redirección inteligente para el móvil."""
+    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update']
     
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
-        # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR) para redirigirlo tras el login
+        # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR de máquina) para redirigirlo tras el login
         next_url = request.url if request.endpoint == 'vista_movil_maquina' else None
         return redirect(url_for('login', next=next_url))
 
 # ==========================================
 # 0. CI/CD: WEBHOOK DE GITHUB (AUTOMATIZACIÓN)
 # ==========================================
-
 @app.route('/webhook-update', methods=['POST'])
 def webhook_update():
     signature = request.headers.get('X-Hub-Signature-256')
@@ -106,18 +103,18 @@ def migrar_base_datos():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM Usuarios")
     if cursor.fetchone()[0] == 0:
-        usuarios_defecto = [('admin', generate_password_hash('Cafetec_Admin2026*'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('Cafe_Tecnico2026*'), 'Juan Pérez', 'Tecnico')]
+        usuarios_defecto = [('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('tec123'), 'Juan Pérez', 'Tecnico')]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
     
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
     
-    # Tabla de mantenimiento con columna codigo_reman
+    # Creación inicial de Calendario_Mantenimiento incluye codigo_reman
     conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
-    # Alteraciones seguras para tablas ya existentes
-    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT") # SIN UNIQUE PARA EVITAR ERROR SQLITE
+    # ACTUALIZACIONES A TABLAS EXISTENTES (ALTER TABLES) - SIN UNIQUE PARA EVITAR ERRORES EN SQLITE
+    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT")
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
@@ -129,6 +126,7 @@ def migrar_base_datos():
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN tiempo_ejecucion TEXT DEFAULT '0 h'")
     except sqlite3.OperationalError: pass 
+    
     try: conn.execute("""CREATE TABLE IF NOT EXISTS Evidencia_Fotografica (id_evidencia INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, imagen_base64 TEXT NOT NULL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE)""")
     except sqlite3.OperationalError: pass
     try: conn.execute("""CREATE TABLE IF NOT EXISTS Compras_Repuestos (id_compra INTEGER PRIMARY KEY AUTOINCREMENT, id_repuesto INTEGER NOT NULL, cantidad REAL NOT NULL, costo_unitario REAL NOT NULL, proveedor TEXT, factura TEXT, fecha_compra TEXT DEFAULT (date('now', 'localtime')), FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto) ON DELETE CASCADE)""")
@@ -136,7 +134,7 @@ def migrar_base_datos():
     conn.commit()
     conn.close()
 
-# CRÍTICO: Ejecutar migración al leer el archivo (soluciona el bug de PythonAnywhere)
+# Ejecutar migración al inicio
 migrar_base_datos()
 
 def obtener_todas_las_maquinas():
@@ -317,7 +315,6 @@ LOGIN_TEMPLATE = """
         
         <form method="POST" action="/login" class="space-y-6">
             {% if next_url %}
-            <!-- Campo oculto para la redirección inteligente -->
             <input type="hidden" name="next" value="{{ next_url }}">
             {% endif %}
             <div>
@@ -355,17 +352,12 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cafetec - Sistema de Mantenimiento</title>
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = { darkMode: 'class', theme: { extend: {} } }
     </script>
-    <!-- FontAwesome Icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
-    <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
@@ -373,15 +365,12 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
-        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
-        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
-        
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
@@ -393,7 +382,6 @@ HTML_TEMPLATE = """
         const CURRENT_ROLE = "{{ session.get('rol', 'Tecnico') }}";
     </script>
 
-    <!-- Notificación Flotante -->
     <div id="toast-notificacion" class="fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform translate-x-[150%] transition-transform duration-300 z-[100] border-l-4 border-cyan-500 font-bold flex items-center">
         <i id="toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="toast-msg">Mensaje</span>
@@ -442,7 +430,6 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
-        <!-- Tarjetas de Resumen (KPIs) -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
                 <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
@@ -484,7 +471,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Gráficos -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
                 <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
@@ -505,7 +491,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TABLAS PRINCIPALES -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <!-- 1. Tabla de Órdenes -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
@@ -602,7 +587,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODALES DE ESCRITORIO -->
         <!-- MODAL: Programar/Editar Orden -->
         <div id="modal-orden" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
@@ -612,7 +596,6 @@ HTML_TEMPLATE = """
                 <form id="form-nueva-orden" onsubmit="guardarOrden(event)">
                     <input type="hidden" id="orden-id">
                     
-                    <!-- CAMPO CÓDIGO RE MAN SECUENCIAL -->
                     <div class="mb-4 bg-slate-950 p-3 rounded-lg border border-slate-800" id="contenedor-reman">
                         <label class="block text-xs font-bold text-cyan-400 uppercase mb-1" title="Si lo dejas en blanco, el sistema generará el siguiente código automáticamente.">
                             <i class="fa-solid fa-barcode mr-1"></i> Forzar Código RE MAN (Opcional)
@@ -656,7 +639,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Registrar Máquina -->
         <div id="modal-maquina" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center">
@@ -697,7 +679,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Ingreso de Mercadería (Compras) -->
         <div id="modal-compra" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-2 text-white flex items-center">
@@ -727,7 +708,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="flex justify-end space-x-3 pt-4 border-t border-slate-700">
                         <button type="button" onclick="cerrarModalCompra()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
-                        <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-50 font-bold transition-all flex items-center">
+                        <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
                             <i class="fa-solid fa-check mr-2"></i> Registrar Stock
                         </button>
                     </div>
@@ -741,7 +722,6 @@ HTML_TEMPLATE = """
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center border-b border-slate-800 pb-3">
                     <i class="fa-solid fa-file-signature text-cyan-400 mr-2"></i> Generar Reporte Técnico
                 </h2>
-                
                 <input type="hidden" id="completar-id-orden">
                 
                 <div class="mb-4">
@@ -835,7 +815,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Libro Mayor de Compras -->
         <div id="modal-historial-compras" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -871,7 +850,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- BOTÓN FLOTANTE: Alertas -->
         <button id="btn-alertas-flotante" onclick="abrirModalAlertas(event)" class="hidden fixed bottom-8 right-8 z-50 bg-rose-600 hover:bg-rose-500 text-white rounded-full p-4 shadow-2xl transition-transform hover:scale-110 group">
             <span class="absolute top-0 right-0 -mt-1 -mr-1 flex h-4 w-4">
               <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
@@ -883,7 +861,6 @@ HTML_TEMPLATE = """
             </span>
         </button>
 
-        <!-- PANEL FLOTANTE: Repuestos a Reabastecer -->
         <div id="modal-alertas-stock" class="hidden fixed bottom-24 right-8 bg-[#0f172a] p-5 rounded-xl shadow-2xl w-96 border border-slate-700 z-50 modal-content" onclick="event.stopPropagation()">
             <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
                 <h2 class="text-base font-bold text-white flex items-center">
@@ -897,6 +874,7 @@ HTML_TEMPLATE = """
                 <ul id="lista-alertas-stock" class="space-y-2"></ul>
             </div>
         </div>
+
     </main>
 
     <script>
@@ -904,6 +882,7 @@ HTML_TEMPLATE = """
             const html = document.documentElement;
             const isDark = html.classList.contains('dark');
             const icon = document.getElementById('theme-icon');
+            
             if (isDark) {
                 html.classList.remove('dark'); localStorage.setItem('theme', 'light');
                 icon.className = 'fa-solid fa-moon'; actualizarGraficosTema(false);
@@ -947,8 +926,7 @@ HTML_TEMPLATE = """
             return `<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md border ${color} shadow-sm uppercase tracking-wide">${status}</span>`;
         }
 
-        let chartMaquinas = null;
-        let chartOrdenes = null;
+        let chartMaquinas = null; let chartOrdenes = null;
 
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
@@ -1005,7 +983,7 @@ HTML_TEMPLATE = """
             const isDark = document.documentElement.classList.contains('dark'); const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
             const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
             chartOrdenes = new Chart(ctxOrdenes, { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
-        }).catch(e => console.log(e));
+        });
 
         fetch('/api/inventario').then(response => response.json()).then(data => {
             let html = ''; let htmlAlertas = ''; let itemsCriticos = 0;
@@ -1742,22 +1720,46 @@ def api_descargar_reporte(id_orden):
     elements.append(t_header)
     elements.append(Spacer(1, 15))
 
+    # --- FUNCIÓN HELPER PARA LIMPIEZA INTELIGENTE DE VIÑETAS ---
+    def formatear_texto_multilinea(texto):
+        if not texto: return "• Ninguno."
+        lineas = texto.split('\n')
+        lineas_formateadas = []
+        for linea in lineas:
+            l = linea.strip()
+            if l:
+                # Si la línea ya tiene un guion o viñeta natural, se respeta sin agregarle un punto extra.
+                if l.startswith('-') or l.startswith('•') or l.startswith('*'):
+                    lineas_formateadas.append(l) 
+                else:
+                    lineas_formateadas.append(f"• {l}")
+        return "<br/>".join(lineas_formateadas)
+
     elements.append(Paragraph("1. INFORMACIÓN GENERAL:", title_style))
     info_text = f"• <b>Fecha de Ejecución:</b> {orden['fecha_ejecucion']}<br/>• <b>Tipo de trabajo a realizar:</b> {orden['tipo_mantenimiento']}<br/>• <b>Código del activo:</b> {orden['codigo_equipo']}<br/>• <b>Nombre de activo:</b> {orden['maquina_nombre']}<br/>• <b>Técnico a cargo:</b> {orden['tecnico_asignado']}<br/>• <b>Duración:</b> {orden['tiempo_ejecucion']}"
     elements.append(Paragraph(info_text, normal_style))
+    
     elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
     elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
-    elements.append(Paragraph("3. TRABAJOS REALIZADOS:", title_style))
-    elements.append(Paragraph(orden['trabajos_realizados'].replace('\n', '<br/>'), normal_style))
-    elements.append(Paragraph("4. DESCRIPCIÓN Y OBSERVACIONES:", title_style))
-    elements.append(Paragraph(f"• {orden['observaciones'].replace(chr(10), '<br/>')}", normal_style))
+    
+    elements.append(Paragraph("3. OBSERVACIONES:", title_style))
+    obs_formateado = formatear_texto_multilinea(orden['observaciones'])
+    elements.append(Paragraph(obs_formateado, normal_style))
+    
+    elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
+    trabajos_formateado = formatear_texto_multilinea(orden['trabajos_realizados'])
+    elements.append(Paragraph(trabajos_formateado, normal_style))
+    
     elements.append(Paragraph("RECURSOS NECESARIOS:", title_style))
     rep_text = "• " + orden['repuestos_usados'].replace('\n', '<br/>• ') if orden['repuestos_usados'] else "<i>No se utilizaron repuestos de almacén.</i>"
     equipos_text = "<br/>".join([f"• {e.strip()}" for e in orden['equipos_necesarios'].split(',') if e.strip()]) or "• Herramientas manuales estándar"
     recursos_text = f"<b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/><b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/><b>Materiales y repuestos:</b><br/>{rep_text}"
     elements.append(Paragraph(recursos_text, normal_style))
+    
     elements.append(Paragraph("5. COMENTARIOS / RECOMENDACIONES:", title_style))
-    elements.append(Paragraph(f"• {orden['recomendaciones'].replace(chr(10), '<br/>')}", normal_style))
+    rec_formateado = formatear_texto_multilinea(orden['recomendaciones'])
+    elements.append(Paragraph(rec_formateado, normal_style))
+    
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     if evidencias_db:
         evidencia_data, row = [], []
@@ -1795,6 +1797,7 @@ def api_descargar_reporte(id_orden):
 
     doc.build(elements)
     file_stream.seek(0)
+    
     codigo_seguro = codigo_pdf.replace(" ", "_")
     return send_file(file_stream, as_attachment=True, download_name=f"{codigo_seguro}_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf", mimetype='application/pdf')
 
