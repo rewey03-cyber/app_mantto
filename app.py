@@ -115,7 +115,7 @@ def migrar_base_datos():
     
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
-    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT UNIQUE")
+    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT")
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
