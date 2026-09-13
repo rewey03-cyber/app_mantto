@@ -19,7 +19,7 @@ except ImportError:
     print("👉 Ejecuta: pip install openpyxl")
     exit(1)
 
-# --- LIBRERÍA PDF (MOTOR DE REPORTES) ---
+# --- LIBRERÍA PDF (NUEVO MOTOR DE REPORTES) ---
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
@@ -30,7 +30,7 @@ except ImportError:
     print("👉 Ejecuta: pip install reportlab")
     exit(1)
 
-# --- LIBRERÍA PARA PROCESAR IMÁGENES ---
+# --- LIBRERÍA PARA PROCESAR IMÁGENES (EVIDENCIA 1:1) ---
 try:
     from PIL import Image as PILImage
 except ImportError:
@@ -59,17 +59,26 @@ GITHUB_SECRET = 'cafetec_github_2026_seguro'
 
 @app.before_request
 def requerir_login():
-    """Protege todas las rutas del sistema, maneja redirección inteligente para el móvil."""
-    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update']
+    """Protege todas las rutas del sistema, excepto el login, QR estático, API móvil y Webhook."""
+    rutas_permitidas = [
+        'login', 
+        'static', 
+        'api_etiqueta_qr', 
+        'vista_movil_maquina', 
+        'webhook_update',
+        'api_inventario',        # Para cargar el select de repuestos en el móvil
+        'api_completar_orden'    # Para guardar el reporte móvil
+    ]
     
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
-        # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR de máquina) para redirigirlo tras el login
+        # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR) para redirigirlo tras el login
         next_url = request.url if request.endpoint == 'vista_movil_maquina' else None
         return redirect(url_for('login', next=next_url))
 
 # ==========================================
 # 0. CI/CD: WEBHOOK DE GITHUB (AUTOMATIZACIÓN)
 # ==========================================
+
 @app.route('/webhook-update', methods=['POST'])
 def webhook_update():
     signature = request.headers.get('X-Hub-Signature-256')
@@ -103,19 +112,17 @@ def migrar_base_datos():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM Usuarios")
     if cursor.fetchone()[0] == 0:
-        usuarios_defecto = [('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('tec123'), 'Juan Pérez', 'Tecnico')]
+        usuarios_defecto = [('admin', generate_password_hash('Cafetec_Admin2026*'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('Cafe_Tecnico2026*'), 'Juan Pérez', 'Tecnico')]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
-    
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
-    
-    # Creación inicial de Calendario_Mantenimiento incluye codigo_reman
     conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
-    # ACTUALIZACIONES A TABLAS EXISTENTES (ALTER TABLES) - SIN UNIQUE PARA EVITAR ERRORES EN SQLITE
+    # IMPORTANTE: No usamos UNIQUE en ALTER TABLE para no romper SQLite si ya hay datos
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT")
     except sqlite3.OperationalError: pass 
+    
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN recomendaciones TEXT DEFAULT 'Ninguna.'")
@@ -134,7 +141,7 @@ def migrar_base_datos():
     conn.commit()
     conn.close()
 
-# Ejecutar migración al inicio
+# Ejecutamos la migración de la Base de Datos a nivel global para que PythonAnywhere lo lea de inmediato
 migrar_base_datos()
 
 def obtener_todas_las_maquinas():
@@ -193,15 +200,17 @@ def obtener_historial_compras_db():
 def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_reman_manual=None):
     conn = get_db_connection()
     
+    # --- LÓGICA DE AUTOGENERACIÓN DEL CÓDIGO RE MAN ---
     codigo_final = ""
+    
     if codigo_reman_manual and str(codigo_reman_manual).strip():
-        # Validar si el usuario proporcionó un código inicial
+        # Si el administrador forzó un número (ej. "280")
         if not str(codigo_reman_manual).upper().startswith("RE MAN-"):
             codigo_final = f"RE MAN-{str(codigo_reman_manual).strip()}"
         else:
             codigo_final = str(codigo_reman_manual).strip().upper()
     else:
-        # Generar consecutivo dinámicamente
+        # Autogeneración dinámica
         cursor = conn.cursor()
         cursor.execute("SELECT codigo_reman FROM Calendario_Mantenimiento WHERE codigo_reman LIKE 'RE MAN-%' ORDER BY id_mantenimiento DESC LIMIT 1")
         ultimo = cursor.fetchone()
@@ -315,6 +324,7 @@ LOGIN_TEMPLATE = """
         
         <form method="POST" action="/login" class="space-y-6">
             {% if next_url %}
+            <!-- Redirección Inteligente tras login -->
             <input type="hidden" name="next" value="{{ next_url }}">
             {% endif %}
             <div>
@@ -358,6 +368,7 @@ HTML_TEMPLATE = """
     </script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
@@ -365,12 +376,15 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
+        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
+        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
+        
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
@@ -407,17 +421,24 @@ HTML_TEMPLATE = """
                     <a href="/monitor" target="_blank" class="hidden sm:flex text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg items-center shadow-inner font-bold text-xs" title="Abrir Monitor de Planta">
                         <i class="fa-solid fa-display mr-2"></i> Monitor
                     </a>
+
                     <button onclick="toggleTheme()" class="text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 p-2.5 rounded-full w-10 h-10 flex justify-center items-center shadow-inner" title="Cambiar Tema">
                         <i id="theme-icon" class="fa-solid fa-sun"></i>
                     </button>
+
+                    <!-- Panel de Usuario y Logout -->
                     <div class="text-sm font-medium bg-slate-900 pl-4 pr-2 py-1.5 rounded-full border border-slate-800 shadow-inner flex items-center text-slate-200">
                         <div class="flex flex-col text-right mr-3 leading-tight hidden sm:flex">
                             <span class="font-bold text-white text-[11px]">{{ session.get('nombre_completo', 'Usuario') }}</span>
                             <span class="text-[9px] text-cyan-400 uppercase tracking-widest font-bold">{{ session.get('rol', 'Técnico') }}</span>
                         </div>
-                        <div class="w-8 h-8 rounded-full bg-cyan-600 flex justify-center items-center mr-3 shadow-md border border-cyan-400">
-                            <i class="fa-solid fa-user-astronaut text-white"></i>
+                        
+                        <!-- CASCO PARA EL TÉCNICO, ASTRONAUTA PARA ADMIN -->
+                        <div class="w-8 h-8 rounded-full flex justify-center items-center mr-3 shadow-md 
+                            {% if session.get('rol') == 'Tecnico' %} bg-[#004b87] border border-cyan-500 {% else %} bg-cyan-600 border border-cyan-400 {% endif %}">
+                            <i class="fa-solid {% if session.get('rol') == 'Tecnico' %} fa-helmet-safety {% else %} fa-user-astronaut {% endif %} text-white {% if session.get('rol') == 'Tecnico' %}text-xs{% endif %}"></i>
                         </div>
+                        
                         <div class="h-6 w-px bg-slate-700 mr-2"></div>
                         <a href="/logout" class="w-8 h-8 rounded-full bg-rose-600/20 text-rose-500 hover:bg-rose-500 hover:text-white flex justify-center items-center transition-colors" title="Cerrar Sesión">
                             <i class="fa-solid fa-right-from-bracket"></i>
@@ -430,72 +451,78 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
-                <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
-                <div class="flex items-center justify-between">
-                    <div>
-                        <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Equipos Registrados</p>
-                        <p class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none" id="kpi-equipos">0</p>
-                    </div>
-                    <div class="w-10 h-10 rounded-full bg-sky-50 dark:bg-sky-900/30 border border-sky-100 dark:border-sky-800 flex items-center justify-center text-cyan-500 group-hover:bg-cyan-500 group-hover:text-white transition-colors">
-                        <i class="fa-solid fa-industry text-sm"></i>
+        <!-- Panel Gerencial a ocultar para Técnicos -->
+        <div id="panel-gerencial">
+            <!-- Tarjetas de Resumen (KPIs) -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
+                    <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Equipos Registrados</p>
+                            <p class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none" id="kpi-equipos">0</p>
+                        </div>
+                        <div class="w-10 h-10 rounded-full bg-sky-50 dark:bg-sky-900/30 border border-sky-100 dark:border-sky-800 flex items-center justify-center text-cyan-500 group-hover:bg-cyan-500 group-hover:text-white transition-colors">
+                            <i class="fa-solid fa-industry text-sm"></i>
+                        </div>
                     </div>
                 </div>
-            </div>
-            
-            <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
-                <div class="absolute left-0 top-0 bottom-0 w-1 bg-rose-500"></div>
-                <div class="flex items-center justify-between">
-                    <div>
-                        <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Órdenes Pendientes</p>
-                        <p class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none" id="kpi-ordenes">0</p>
+                
+                <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
+                    <div class="absolute left-0 top-0 bottom-0 w-1 bg-rose-500"></div>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Órdenes Pendientes</p>
+                            <p class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none" id="kpi-ordenes">0</p>
+                        </div>
+                        <div class="w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-500 group-hover:bg-rose-500 group-hover:text-white transition-colors">
+                            <i class="fa-solid fa-triangle-exclamation text-sm"></i>
+                        </div>
                     </div>
-                    <div class="w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-500 group-hover:bg-rose-500 group-hover:text-white transition-colors">
-                        <i class="fa-solid fa-triangle-exclamation text-sm"></i>
+                </div>
+
+                <div id="kpi-planta-card" class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
+                    <div id="kpi-planta-border" class="absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300"></div>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Estado Planta</p>
+                            <p id="kpi-planta-text" class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none">Operativa</p>
+                        </div>
+                        <div id="kpi-planta-icon-bg" class="w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white">
+                            <i id="kpi-planta-icon" class="fa-solid fa-check-double text-sm"></i>
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <div id="kpi-planta-card" class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
-                <div id="kpi-planta-border" class="absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300"></div>
-                <div class="flex items-center justify-between">
-                    <div>
-                        <p class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-0.5">Estado Planta</p>
-                        <p id="kpi-planta-text" class="text-2xl font-black text-slate-800 dark:text-slate-100 leading-none">Operativa</p>
+            <!-- Gráficos de Estado (Chart.js) -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
+                    <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
+                        <i class="fa-solid fa-chart-pie text-cyan-600 mr-2"></i> Salud de Equipos
+                    </h3>
+                    <div class="relative h-48 w-full flex justify-center">
+                        <canvas id="graficoMaquinas"></canvas>
                     </div>
-                    <div id="kpi-planta-icon-bg" class="w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white">
-                        <i id="kpi-planta-icon" class="fa-solid fa-check-double text-sm"></i>
+                </div>
+
+                <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
+                    <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
+                        <i class="fa-solid fa-chart-bar text-cyan-600 mr-2"></i> Carga de Trabajo Activa
+                    </h3>
+                    <div class="relative h-48 w-full flex justify-center">
+                        <canvas id="graficoOrdenes"></canvas>
                     </div>
                 </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-            <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
-                <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
-                    <i class="fa-solid fa-chart-pie text-cyan-600 mr-2"></i> Salud de Equipos
-                </h3>
-                <div class="relative h-48 w-full flex justify-center">
-                    <canvas id="graficoMaquinas"></canvas>
-                </div>
-            </div>
-
-            <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
-                <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
-                    <i class="fa-solid fa-chart-bar text-cyan-600 mr-2"></i> Carga de Trabajo Activa
-                </h3>
-                <div class="relative h-48 w-full flex justify-center">
-                    <canvas id="graficoOrdenes"></canvas>
-                </div>
-            </div>
-        </div>
-
+        <!-- TABLAS PRINCIPALES -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <!-- 1. Tabla de Órdenes -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
                 <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
-                    <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
+                    <h3 id="titulo-tabla-ordenes" class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
                         <i class="fa-solid fa-wrench text-cyan-500 mr-2"></i> Órdenes de Trabajo
                     </h3>
                     <div class="flex space-x-2">
@@ -639,6 +666,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Registrar Máquina -->
         <div id="modal-maquina" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center">
@@ -679,6 +707,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Ingreso de Mercadería (Compras) -->
         <div id="modal-compra" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-2 text-white flex items-center">
@@ -688,6 +717,7 @@ HTML_TEMPLATE = """
                 
                 <form id="form-registro-compra" onsubmit="guardarCompra(event)">
                     <input type="hidden" id="compra-id-repuesto">
+                    
                     <div class="grid grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Cantidad Recibida</label>
@@ -698,14 +728,17 @@ HTML_TEMPLATE = """
                             <input type="number" id="compra-costo" required min="0" step="0.01" class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: 15.50">
                         </div>
                     </div>
+                    
                     <div class="mb-4">
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Proveedor / Tienda</label>
                         <input type="text" id="compra-proveedor" required class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: Ferretería Industrial">
                     </div>
+                    
                     <div class="mb-6">
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-1">N° Factura / Boleta / OC</label>
                         <input type="text" id="compra-factura" required class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: F001-4589">
                     </div>
+
                     <div class="flex justify-end space-x-3 pt-4 border-t border-slate-700">
                         <button type="button" onclick="cerrarModalCompra()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
                         <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
@@ -722,6 +755,7 @@ HTML_TEMPLATE = """
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center border-b border-slate-800 pb-3">
                     <i class="fa-solid fa-file-signature text-cyan-400 mr-2"></i> Generar Reporte Técnico
                 </h2>
+                
                 <input type="hidden" id="completar-id-orden">
                 
                 <div class="mb-4">
@@ -815,6 +849,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Libro Mayor de Compras -->
         <div id="modal-historial-compras" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -850,6 +885,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- BOTÓN FLOTANTE: Alertas -->
         <button id="btn-alertas-flotante" onclick="abrirModalAlertas(event)" class="hidden fixed bottom-8 right-8 z-50 bg-rose-600 hover:bg-rose-500 text-white rounded-full p-4 shadow-2xl transition-transform hover:scale-110 group">
             <span class="absolute top-0 right-0 -mt-1 -mr-1 flex h-4 w-4">
               <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
@@ -861,6 +897,7 @@ HTML_TEMPLATE = """
             </span>
         </button>
 
+        <!-- PANEL FLOTANTE: Repuestos a Reabastecer -->
         <div id="modal-alertas-stock" class="hidden fixed bottom-24 right-8 bg-[#0f172a] p-5 rounded-xl shadow-2xl w-96 border border-slate-700 z-50 modal-content" onclick="event.stopPropagation()">
             <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
                 <h2 class="text-base font-bold text-white flex items-center">
@@ -878,17 +915,22 @@ HTML_TEMPLATE = """
     </main>
 
     <script>
+        // --- LOGICA DE TEMA (DARK/LIGHT) ---
         function toggleTheme() {
             const html = document.documentElement;
             const isDark = html.classList.contains('dark');
             const icon = document.getElementById('theme-icon');
             
             if (isDark) {
-                html.classList.remove('dark'); localStorage.setItem('theme', 'light');
-                icon.className = 'fa-solid fa-moon'; actualizarGraficosTema(false);
+                html.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+                icon.className = 'fa-solid fa-moon';
+                actualizarGraficosTema(false);
             } else {
-                html.classList.add('dark'); localStorage.setItem('theme', 'dark');
-                icon.className = 'fa-solid fa-sun text-amber-400'; actualizarGraficosTema(true);
+                html.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+                icon.className = 'fa-solid fa-sun text-amber-400';
+                actualizarGraficosTema(true);
             }
         }
 
@@ -896,17 +938,21 @@ HTML_TEMPLATE = """
             const html = document.documentElement;
             const icon = document.getElementById('theme-icon');
             if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-                html.classList.add('dark'); if(icon) icon.className = 'fa-solid fa-sun text-amber-400';
+                html.classList.add('dark');
+                if(icon) icon.className = 'fa-solid fa-sun text-amber-400';
             } else {
-                html.classList.remove('dark'); if(icon) icon.className = 'fa-solid fa-moon';
+                html.classList.remove('dark');
+                if(icon) icon.className = 'fa-solid fa-moon';
             }
         }
         applySavedTheme();
 
+        // --- SISTEMA DE NOTIFICACIONES ---
         function mostrarNotificacion(mensaje, tipo='info') {
             const toast = document.getElementById('toast-notificacion');
             const icon = document.getElementById('toast-icon');
             document.getElementById('toast-msg').innerText = mensaje;
+            
             if(tipo === 'error') {
                 toast.className = "fixed top-5 right-5 bg-rose-600 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] font-bold flex items-center transition-transform duration-300";
                 icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
@@ -914,6 +960,7 @@ HTML_TEMPLATE = """
                 toast.className = "fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] border-l-4 border-cyan-500 font-bold flex items-center transition-transform duration-300";
                 icon.className = "fa-solid fa-circle-check mr-3 text-cyan-400 text-lg";
             }
+
             toast.style.transform = "translateX(0)";
             setTimeout(() => { toast.style.transform = "translateX(150%)"; }, 3500);
         }
@@ -926,89 +973,270 @@ HTML_TEMPLATE = """
             return `<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md border ${color} shadow-sm uppercase tracking-wide">${status}</span>`;
         }
 
-        let chartMaquinas = null; let chartOrdenes = null;
+        let chartMaquinas = null;
+        let chartOrdenes = null;
 
+        // --- LÓGICA DE UX POR ROLES ---
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
             document.getElementById('btn-historial-compras')?.classList.add('hidden');
             document.getElementById('btn-add-orden')?.classList.add('hidden');
+            
+            // Ocultar todo el panel gerencial (Tarjetas y Gráficos)
+            document.getElementById('panel-gerencial')?.classList.add('hidden');
+            
+            // Cambiar el título de la tabla de órdenes
+            const tituloOrdenes = document.getElementById('titulo-tabla-ordenes');
+            if(tituloOrdenes) {
+                tituloOrdenes.innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-500 mr-2"></i> Mis Tareas Pendientes';
+            }
         }
 
-        fetch('/api/maquinas').then(response => response.json()).then(data => {
-            document.getElementById('kpi-equipos').innerText = data.length;
-            let html = ''; let maquinasDetenidas = 0; let maquinasOperativas = 0;
-            data.forEach(maquina => {
-                if (maquina.estado !== 'Operativa') maquinasDetenidas++; else maquinasOperativas++;
-                let btnImprimirQR = CURRENT_ROLE === 'Admin' ? `<a href="/api/maquinas/etiqueta/${maquina.id_maquina}" target="_blank" class="text-cyan-500 hover:text-cyan-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Imprimir QR"><i class="fa-solid fa-qrcode"></i></a>` : '';
-                let btnEliminar = CURRENT_ROLE === 'Admin' ? `<button onclick="eliminarMaquina(${maquina.id_maquina})" class="text-slate-300 dark:text-slate-600 hover:text-rose-600 dark:hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar equipo"><i class="fa-solid fa-trash-can"></i></button>` : '';
-                html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${maquina.codigo_equipo}</td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400"><div class="font-bold text-slate-800 dark:text-slate-200 uppercase">${maquina.nombre}</div><span class="text-[10px] text-slate-400 dark:text-slate-500 font-medium">Área: ${maquina.area_planta}</span></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(maquina.estado)}<div class="flex items-center">${btnImprimirQR}${btnEliminar}</div></div></td></tr>`;
-            });
-            document.getElementById('tabla-maquinas').innerHTML = html;
+        // Cargar Máquinas
+        fetch('/api/maquinas')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('kpi-equipos').innerText = data.length;
+                let html = '';
+                let maquinasDetenidas = 0;
+                let maquinasOperativas = 0;
+                
+                data.forEach(maquina => {
+                    if (maquina.estado !== 'Operativa') maquinasDetenidas++;
+                    else maquinasOperativas++;
 
-            const border = document.getElementById('kpi-planta-border'); const iconBg = document.getElementById('kpi-planta-icon-bg'); const icon = document.getElementById('kpi-planta-icon'); const text = document.getElementById('kpi-planta-text');
-            if (data.length === 0) { text.innerText = "Sin Datos"; } 
-            else if (maquinasDetenidas === 0) {
-                text.innerText = "Operativa"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300";
-                iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white"; icon.className = "fa-solid fa-check-double text-sm";
-            } else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) {
-                text.innerText = "Op. Parcial"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300";
-                iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white"; icon.className = "fa-solid fa-triangle-exclamation text-sm";
-            } else {
-                text.innerText = "Parada General"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300";
-                iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white"; icon.className = "fa-solid fa-circle-xmark text-sm";
-            }
+                    let btnImprimirQR = CURRENT_ROLE === 'Admin' ? `<a href="/api/maquinas/etiqueta/${maquina.id_maquina}" target="_blank" class="text-cyan-500 hover:text-cyan-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Imprimir QR"><i class="fa-solid fa-qrcode"></i></a>` : '';
+                    let btnEliminar = CURRENT_ROLE === 'Admin' ? `<button onclick="eliminarMaquina(${maquina.id_maquina})" class="text-slate-300 dark:text-slate-600 hover:text-rose-600 dark:hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar equipo"><i class="fa-solid fa-trash-can"></i></button>` : '';
 
-            const isDark = document.documentElement.classList.contains('dark'); const darkColor = isDark ? '#334155' : '#1e293b';
-            const ctxMaquinas = document.getElementById('graficoMaquinas').getContext('2d');
-            chartMaquinas = new Chart(ctxMaquinas, { type: 'doughnut', data: { labels: ['Operativas', 'En Mantenimiento'], datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' } });
-        });
-
-        fetch('/api/ordenes').then(response => response.json()).then(data => {
-            document.getElementById('kpi-ordenes').innerText = data.length;
-            let html = ''; let prev = 0, corr = 0, pred = 0;
-            if(data.length === 0) {
-                html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>';
-            } else {
-                data.forEach(orden => {
-                    if(orden.tipo_mantenimiento === 'Preventivo') prev++; if(orden.tipo_mantenimiento === 'Correctivo') corr++; if(orden.tipo_mantenimiento === 'Predictivo') pred++;
-                    let btnsAdmin = '';
-                    if (CURRENT_ROLE === 'Admin') {
-                        btnsAdmin = `<button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button><button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>`;
-                    }
-                    let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
-                    html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${orden.codigo_equipo}</td><td class="px-5 py-3 text-[11px] text-slate-600 dark:text-slate-400">${codRemanDisplay}<div class="font-bold text-slate-800 dark:text-slate-200">${orden.tipo_mantenimiento}</div><div class="truncate w-40 text-slate-500 dark:text-slate-400" title="${orden.descripcion_tarea}">${orden.descripcion_tarea}</div><div class="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mt-0.5"><i class="fa-regular fa-calendar mr-1"></i> ${orden.fecha_programada}</div></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(orden.estado_orden)}<div class="flex items-center">${btnsAdmin}<button onclick="abrirModalCompletar(${orden.id_mantenimiento})" class="text-slate-400 dark:text-slate-500 hover:text-cyan-500 dark:hover:text-cyan-400 transition-colors ml-3 opacity-0 group-hover:opacity-100" title="Marcar finalizada y generar reporte"><i class="fa-solid fa-file-signature text-xl"></i></button></div></div></td></tr>`;
+                    html += `
+                        <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group">
+                            <td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${maquina.codigo_equipo}</td>
+                            <td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400">
+                                <div class="font-bold text-slate-800 dark:text-slate-200 uppercase">${maquina.nombre}</div>
+                                <span class="text-[10px] text-slate-400 dark:text-slate-500 font-medium">Área: ${maquina.area_planta}</span>
+                            </td>
+                            <td class="px-5 py-3 whitespace-nowrap">
+                                <div class="flex items-center justify-between">
+                                    ${getBadge(maquina.estado)}
+                                    <div class="flex items-center">
+                                        ${btnImprimirQR}
+                                        ${btnEliminar}
+                                    </div>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
                 });
-            }
-            document.getElementById('tabla-ordenes').innerHTML = html;
-            const isDark = document.documentElement.classList.contains('dark'); const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
-            const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
-            chartOrdenes = new Chart(ctxOrdenes, { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
-        });
+                document.getElementById('tabla-maquinas').innerHTML = html;
 
-        fetch('/api/inventario').then(response => response.json()).then(data => {
-            let html = ''; let htmlAlertas = ''; let itemsCriticos = 0;
-            data.forEach(item => {
-                let estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50 uppercase tracking-wide">Óptimo</span>';
-                let textClass = "text-slate-800 dark:text-slate-200";
-                if (item.cantidad_actual <= item.punto_reorden) {
-                    estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>'; textClass = "text-rose-600 dark:text-rose-400 font-bold"; itemsCriticos++;
-                    htmlAlertas += `<li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm"><div><span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span><span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span></div><div class="text-right flex flex-col items-end"><div class="flex items-baseline space-x-1"><span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span></div><div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div></div></li>`;
+                const border = document.getElementById('kpi-planta-border');
+                const iconBg = document.getElementById('kpi-planta-icon-bg');
+                const icon = document.getElementById('kpi-planta-icon');
+                const text = document.getElementById('kpi-planta-text');
+
+                if (data.length === 0) {
+                    text.innerText = "Sin Datos";
+                } else if (maquinasDetenidas === 0) {
+                    text.innerText = "Operativa";
+                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300";
+                    iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white";
+                    icon.className = "fa-solid fa-check-double text-sm";
+                } else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) {
+                    text.innerText = "Op. Parcial";
+                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300";
+                    iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white";
+                    icon.className = "fa-solid fa-triangle-exclamation text-sm";
+                } else {
+                    text.innerText = "Parada General";
+                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300";
+                    iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white";
+                    icon.className = "fa-solid fa-circle-xmark text-sm";
                 }
-                let botonesAccionHtml = '';
-                if(CURRENT_ROLE === 'Admin') {
-                    botonesAccionHtml = `<div class="flex items-center space-x-1"><button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button><button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button><div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div><button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button></div>`;
-                }
-                html += `<tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-5 py-3 whitespace-nowrap"><div class="text-[11px] font-bold text-slate-800 dark:text-slate-200">${item.codigo_pieza}</div><div class="text-[11px] text-slate-500 dark:text-slate-400">${item.nombre}</div></td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400 font-medium"><i class="fa-solid fa-location-dot mr-1 text-slate-400 dark:text-slate-500"></i> ${item.ubicacion_almacen}</td><td class="px-5 py-3 whitespace-nowrap text-[11px]"><div class="flex items-center space-x-3"><div class="w-16"><span class="${textClass} text-lg">${item.cantidad_actual}</span> <span class="text-slate-400 dark:text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span><div class="text-[9px] text-slate-400 dark:text-slate-500 font-medium uppercase mt-0.5">Mínimo: ${item.punto_reorden}</div></div>${botonesAccionHtml}</div></td><td class="px-5 py-3 whitespace-nowrap">${estadoStock}</td></tr>`;
+
+                const isDark = document.documentElement.classList.contains('dark');
+                const darkColor = isDark ? '#334155' : '#1e293b';
+                
+                const ctxMaquinas = document.getElementById('graficoMaquinas').getContext('2d');
+                chartMaquinas = new Chart(ctxMaquinas, {
+                    type: 'doughnut',
+                    data: {
+                        labels: ['Operativas', 'En Mantenimiento'],
+                        datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }]
+                    },
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' }
+                });
             });
-            document.getElementById('tabla-inventario').innerHTML = html;
-            const btnFlotante = document.getElementById('btn-alertas-flotante'); const listaAlertas = document.getElementById('lista-alertas-stock');
-            if (itemsCriticos > 0) { btnFlotante.classList.remove('hidden'); listaAlertas.innerHTML = htmlAlertas; } else { btnFlotante.classList.add('hidden'); }
-        });
+
+        // Cargar Órdenes
+        fetch('/api/ordenes')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('kpi-ordenes').innerText = data.length;
+                let html = '';
+                let prev = 0, corr = 0, pred = 0;
+
+                if(data.length === 0) {
+                    html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>';
+                } else {
+                    data.forEach(orden => {
+                        if(orden.tipo_mantenimiento === 'Preventivo') prev++;
+                        if(orden.tipo_mantenimiento === 'Correctivo') corr++;
+                        if(orden.tipo_mantenimiento === 'Predictivo') pred++;
+
+                        let btnsAdmin = '';
+                        if (CURRENT_ROLE === 'Admin') {
+                            btnsAdmin = `
+                                <button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button>
+                                <button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>
+                            `;
+                        }
+
+                        let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
+
+                        html += `
+                            <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group">
+                                <td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${orden.codigo_equipo}</td>
+                                <td class="px-5 py-3 text-[11px] text-slate-600 dark:text-slate-400">
+                                    ${codRemanDisplay}
+                                    <div class="font-bold text-slate-800 dark:text-slate-200">${orden.tipo_mantenimiento}</div>
+                                    <div class="truncate w-40 text-slate-500 dark:text-slate-400" title="${orden.descripcion_tarea}">${orden.descripcion_tarea}</div>
+                                    <div class="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mt-0.5"><i class="fa-regular fa-calendar mr-1"></i> ${orden.fecha_programada}</div>
+                                </td>
+                                <td class="px-5 py-3 whitespace-nowrap">
+                                    <div class="flex items-center justify-between">
+                                        ${getBadge(orden.estado_orden)}
+                                        <div class="flex items-center">
+                                            ${btnsAdmin}
+                                            <button onclick="abrirModalCompletar(${orden.id_mantenimiento})" class="text-slate-400 dark:text-slate-500 hover:text-cyan-500 dark:hover:text-cyan-400 transition-colors ml-3 opacity-0 group-hover:opacity-100" title="Marcar finalizada y generar reporte">
+                                                <i class="fa-solid fa-file-signature text-xl"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                }
+                document.getElementById('tabla-ordenes').innerHTML = html;
+
+                const isDark = document.documentElement.classList.contains('dark');
+                const darkGrid = isDark ? '#334155' : '#e2e8f0';
+                const darkText = isDark ? '#94a3b8' : '#64748b';
+
+                const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
+                chartOrdenes = new Chart(ctxOrdenes, {
+                    type: 'bar',
+                    data: {
+                        labels: ['Preventivo', 'Correctivo', 'Predictivo'],
+                        datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }]
+                    },
+                    options: { 
+                        responsive: true, maintainAspectRatio: false, 
+                        plugins: { legend: { display: false } }, 
+                        scales: { 
+                            y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, 
+                            x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } 
+                        } 
+                    }
+                });
+            });
+
+        // Cargar Inventario
+        fetch('/api/inventario')
+            .then(response => response.json())
+            .then(data => {
+                let html = '';
+                let htmlAlertas = '';
+                let itemsCriticos = 0;
+
+                data.forEach(item => {
+                    let estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50 uppercase tracking-wide">Óptimo</span>';
+                    let textClass = "text-slate-800 dark:text-slate-200";
+                    
+                    if (item.cantidad_actual <= item.punto_reorden) {
+                        estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>';
+                        textClass = "text-rose-600 dark:text-rose-400 font-bold";
+                        itemsCriticos++;
+                        
+                        htmlAlertas += `
+                            <li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm">
+                                <div>
+                                    <span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span>
+                                    <span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span>
+                                </div>
+                                <div class="text-right flex flex-col items-end">
+                                    <div class="flex items-baseline space-x-1">
+                                        <span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> 
+                                        <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span>
+                                    </div>
+                                    <div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div>
+                                </div>
+                            </li>
+                        `;
+                    }
+
+                    let botonesAccionHtml = '';
+                    if(CURRENT_ROLE === 'Admin') {
+                        botonesAccionHtml = `
+                            <div class="flex items-center space-x-1">
+                                <button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button>
+                                <button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button>
+                                <div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div>
+                                <button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button>
+                            </div>
+                        `;
+                    }
+
+                    html += `
+                        <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                            <td class="px-5 py-3 whitespace-nowrap">
+                                <div class="text-[11px] font-bold text-slate-800 dark:text-slate-200">${item.codigo_pieza}</div>
+                                <div class="text-[11px] text-slate-500 dark:text-slate-400">${item.nombre}</div>
+                            </td>
+                            <td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400 font-medium">
+                                <i class="fa-solid fa-location-dot mr-1 text-slate-400 dark:text-slate-500"></i> ${item.ubicacion_almacen}
+                            </td>
+                            <td class="px-5 py-3 whitespace-nowrap text-[11px]">
+                                <div class="flex items-center space-x-3">
+                                    <div class="w-16">
+                                        <span class="${textClass} text-lg">${item.cantidad_actual}</span> <span class="text-slate-400 dark:text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span>
+                                        <div class="text-[9px] text-slate-400 dark:text-slate-500 font-medium uppercase mt-0.5">Mínimo: ${item.punto_reorden}</div>
+                                    </div>
+                                    ${botonesAccionHtml}
+                                </div>
+                            </td>
+                            <td class="px-5 py-3 whitespace-nowrap">${estadoStock}</td>
+                        </tr>
+                    `;
+                });
+                document.getElementById('tabla-inventario').innerHTML = html;
+                
+                const btnFlotante = document.getElementById('btn-alertas-flotante');
+                const listaAlertas = document.getElementById('lista-alertas-stock');
+                
+                if (itemsCriticos > 0) {
+                    btnFlotante.classList.remove('hidden');
+                    listaAlertas.innerHTML = htmlAlertas;
+                } else {
+                    btnFlotante.classList.add('hidden');
+                }
+            });
 
         function actualizarGraficosTema(isDark) {
-            const darkColor = isDark ? '#334155' : '#1e293b'; const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
-            if(chartMaquinas) { chartMaquinas.data.datasets[0].backgroundColor[1] = darkColor; chartMaquinas.update(); }
-            if(chartOrdenes) { chartOrdenes.options.scales.x.ticks.color = darkText; chartOrdenes.options.scales.y.ticks.color = darkText; chartOrdenes.options.scales.y.grid.color = darkGrid; chartOrdenes.update(); }
+            const darkColor = isDark ? '#334155' : '#1e293b';
+            const darkGrid = isDark ? '#334155' : '#e2e8f0';
+            const darkText = isDark ? '#94a3b8' : '#64748b';
+
+            if(chartMaquinas) {
+                chartMaquinas.data.datasets[0].backgroundColor[1] = darkColor;
+                chartMaquinas.update();
+            }
+            if(chartOrdenes) {
+                chartOrdenes.options.scales.x.ticks.color = darkText;
+                chartOrdenes.options.scales.y.ticks.color = darkText;
+                chartOrdenes.options.scales.y.grid.color = darkGrid;
+                chartOrdenes.update();
+            }
         }
 
         function descontarStock(id) { fetch(`/api/inventario/descontar/${id}`, {method:'POST'}).then(r=>r.json()).then(d=>{if(d.status==='ok')window.location.reload();}); }
@@ -1016,93 +1244,306 @@ HTML_TEMPLATE = """
         function filtrarInventario() { const txt = document.getElementById('buscador-inventario').value.toLowerCase(); document.querySelectorAll('#tabla-inventario tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
         function filtrarMaquinas() { const txt = document.getElementById('buscador-maquinas').value.toLowerCase(); document.querySelectorAll('#tabla-maquinas tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
 
-        function abrirModalCompra(id_repuesto, codigo, nombre) { document.getElementById('compra-id-repuesto').value = id_repuesto; document.getElementById('compra-subtitulo').innerText = `${codigo} - ${nombre}`; document.getElementById('form-registro-compra').reset(); document.getElementById('modal-compra').classList.remove('hidden'); }
+        // MODAL COMPRAS
+        function abrirModalCompra(id_repuesto, codigo, nombre) {
+            document.getElementById('compra-id-repuesto').value = id_repuesto;
+            document.getElementById('compra-subtitulo').innerText = `${codigo} - ${nombre}`;
+            document.getElementById('form-registro-compra').reset();
+            document.getElementById('modal-compra').classList.remove('hidden');
+        }
         function cerrarModalCompra() { document.getElementById('modal-compra').classList.add('hidden'); }
-        function guardarCompra(e) { e.preventDefault(); const id = document.getElementById('compra-id-repuesto').value; fetch(`/api/inventario/comprar/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cantidad: document.getElementById('compra-cantidad').value, costo: document.getElementById('compra-costo').value, proveedor: document.getElementById('compra-proveedor').value, factura: document.getElementById('compra-factura').value }) }).then(r => r.json()).then(res => { if(res.status === 'ok') window.location.reload(); }); }
+        function guardarCompra(e) {
+            e.preventDefault();
+            const id = document.getElementById('compra-id-repuesto').value;
+            fetch(`/api/inventario/comprar/${id}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    cantidad: document.getElementById('compra-cantidad').value,
+                    costo: document.getElementById('compra-costo').value,
+                    proveedor: document.getElementById('compra-proveedor').value,
+                    factura: document.getElementById('compra-factura').value
+                })
+            }).then(r => r.json()).then(res => { if(res.status === 'ok') window.location.reload(); });
+        }
         
         function abrirModalCompras() {
             fetch('/api/compras').then(res => res.json()).then(data => {
                 let html = '';
-                if(data.length === 0) { html = '<tr><td colspan="7" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">No hay registros de compras.</td></tr>'; } 
-                else { data.forEach(c => { html += `<tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar text-emerald-500 mr-1"></i> ${c.fecha_compra}</td><td class="px-4 py-3 whitespace-nowrap text-xs"><span class="font-bold text-slate-800 dark:text-slate-200">${c.codigo_pieza}</span><br><span class="text-[10px] text-slate-500 dark:text-slate-400">${c.nombre}</span></td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-700 dark:text-slate-300 text-center">${c.cantidad}</td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 text-right">$${c.costo_unitario.toFixed(2)}</td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-emerald-600 dark:text-emerald-400 text-right">$${c.costo_total.toFixed(2)}</td><td class="px-4 py-3 text-xs text-slate-600 dark:text-slate-400 pl-6">${c.proveedor}</td><td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${c.factura}</span></td></tr>`; }); }
-                document.getElementById('tabla-historial-compras').innerHTML = html; document.getElementById('modal-historial-compras').classList.remove('hidden');
+                if(data.length === 0) {
+                    html = '<tr><td colspan="7" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">No hay registros de compras.</td></tr>';
+                } else {
+                    data.forEach(c => {
+                        html += `
+                            <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar text-emerald-500 mr-1"></i> ${c.fecha_compra}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs"><span class="font-bold text-slate-800 dark:text-slate-200">${c.codigo_pieza}</span><br><span class="text-[10px] text-slate-500 dark:text-slate-400">${c.nombre}</span></td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-700 dark:text-slate-300 text-center">${c.cantidad}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 text-right">$${c.costo_unitario.toFixed(2)}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-emerald-600 dark:text-emerald-400 text-right">$${c.costo_total.toFixed(2)}</td>
+                                <td class="px-4 py-3 text-xs text-slate-600 dark:text-slate-400 pl-6">${c.proveedor}</td>
+                                <td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${c.factura}</span></td>
+                            </tr>
+                        `;
+                    });
+                }
+                document.getElementById('tabla-historial-compras').innerHTML = html;
+                document.getElementById('modal-historial-compras').classList.remove('hidden');
             });
         }
         function cerrarModalCompras() { document.getElementById('modal-historial-compras').classList.add('hidden'); }
 
+        // MODAL ÓRDENES
         function abrirModalOrden() { 
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-400 mr-2"></i> Programar Orden';
             document.getElementById('form-nueva-orden').reset();
             document.getElementById('orden-id').value = '';
             document.getElementById('contenedor-reman').classList.remove('hidden');
             document.getElementById('modal-orden').classList.remove('hidden'); 
-            fetch('/api/maquinas').then(r => r.json()).then(data => { let s = document.getElementById('select-maquina'); s.innerHTML = '<option value="" disabled selected>Seleccione...</option>'; data.forEach(m => { s.innerHTML += `<option value="${m.id_maquina}" title="${m.codigo_equipo} - ${m.nombre}">${m.codigo_equipo} - ${m.nombre}</option>`; }); });
+            
+            fetch('/api/maquinas').then(r => r.json()).then(data => {
+                let s = document.getElementById('select-maquina'); 
+                s.innerHTML = '<option value="" disabled selected>Seleccione...</option>'; 
+                data.forEach(m => {
+                    s.innerHTML += `<option value="${m.id_maquina}" title="${m.codigo_equipo} - ${m.nombre}">${m.codigo_equipo} - ${m.nombre}</option>`;
+                });
+            });
         }
 
         function editarOrden(id_orden, id_maquina, tipo, desc, fecha, tecnico) {
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-pen-to-square text-amber-500 mr-2"></i> Editar Orden';
-            document.getElementById('orden-id').value = id_orden; document.getElementById('select-tipo').value = tipo; document.getElementById('input-descripcion').value = desc; document.getElementById('input-fecha').value = fecha; document.getElementById('input-tecnico').value = tecnico;
+            document.getElementById('orden-id').value = id_orden;
+            document.getElementById('select-tipo').value = tipo;
+            document.getElementById('input-descripcion').value = desc;
+            document.getElementById('input-fecha').value = fecha;
+            document.getElementById('input-tecnico').value = tecnico;
             document.getElementById('contenedor-reman').classList.add('hidden');
-            fetch('/api/maquinas').then(r => r.json()).then(data => { let s = document.getElementById('select-maquina'); s.innerHTML = ''; data.forEach(m => { let sel = m.id_maquina === id_maquina ? 'selected' : ''; s.innerHTML += `<option value="${m.id_maquina}" ${sel}>${m.codigo_equipo} - ${m.nombre}</option>`; }); });
+            
+            fetch('/api/maquinas').then(r => r.json()).then(data => {
+                let s = document.getElementById('select-maquina'); 
+                s.innerHTML = ''; 
+                data.forEach(m => {
+                    let sel = m.id_maquina === id_maquina ? 'selected' : '';
+                    s.innerHTML += `<option value="${m.id_maquina}" ${sel}>${m.codigo_equipo} - ${m.nombre}</option>`;
+                });
+            });
             document.getElementById('modal-orden').classList.remove('hidden');
         }
 
-        function eliminarOrden(id) { fetch(`/api/ordenes/eliminar/${id}`, {method:'DELETE'}).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); }); }
-        function cerrarModalOrden() { document.getElementById('modal-orden').classList.add('hidden'); }
+        function eliminarOrden(id) {
+            fetch(`/api/ordenes/eliminar/${id}`, {method:'DELETE'}).then(r=>r.json()).then(res=>{
+                if(res.status==='ok') window.location.reload(); 
+            });
+        }
+
+        function cerrarModalOrden() { 
+            document.getElementById('modal-orden').classList.add('hidden'); 
+        }
 
         function guardarOrden(e) { 
             e.preventDefault(); 
             const id_orden = document.getElementById('orden-id').value;
-            const inputManual = document.getElementById('input-reman-manual');
-            const payload = { id_maquina: document.getElementById('select-maquina').value, tipo_mantenimiento: document.getElementById('select-tipo').value, descripcion: document.getElementById('input-descripcion').value, fecha: document.getElementById('input-fecha').value, tecnico: document.getElementById('input-tecnico').value, codigo_reman_manual: inputManual ? inputManual.value : '' };
+            const payload = {
+                id_maquina: document.getElementById('select-maquina').value, 
+                tipo_mantenimiento: document.getElementById('select-tipo').value, 
+                descripcion: document.getElementById('input-descripcion').value, 
+                fecha: document.getElementById('input-fecha').value, 
+                tecnico: document.getElementById('input-tecnico').value,
+                codigo_reman_manual: document.getElementById('input-reman-manual') ? document.getElementById('input-reman-manual').value : ''
+            };
+
             const endpoint = id_orden ? `/api/ordenes/editar/${id_orden}` : '/api/ordenes/nueva';
-            fetch(endpoint, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); }); 
+            
+            fetch(endpoint, {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(payload)
+            }).then(r=>r.json()).then(res=>{
+                if(res.status==='ok') window.location.reload();
+            }); 
         }
 
         function abrirModalMaquina() { document.getElementById('modal-maquina').classList.remove('hidden'); }
         function cerrarModalMaquina() { document.getElementById('modal-maquina').classList.add('hidden'); document.getElementById('form-nueva-maquina').reset(); }
         function guardarMaquina(e) { e.preventDefault(); fetch('/api/maquinas/nueva',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({codigo:document.getElementById('input-maq-codigo').value, nombre:document.getElementById('input-maq-nombre').value, area:document.getElementById('select-maq-area').value, criticidad:document.getElementById('select-maq-criticidad').value})}).then(r=>r.json()).then(res=>{if(res.status==='ok') window.location.reload();}); }
-        function eliminarMaquina(id) { fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error'); }); }
+        
+        function eliminarMaquina(id) { 
+            fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{
+                if(res.status==='ok') window.location.reload(); 
+                else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error');
+            }); 
+        }
 
-        let repuestosUsadosTemp = []; let evidenciasBase64 = []; const modalCompletar = document.getElementById('modal-completar');
+        // LÓGICA AVANZADA: COMPLETAR ORDEN Y REPORTE
+        let repuestosUsadosTemp = [];
+        let evidenciasBase64 = [];
+        const modalCompletar = document.getElementById('modal-completar');
+
         function abrirModalCompletar(id_orden) {
-            document.getElementById('completar-id-orden').value = id_orden; document.getElementById('input-obs').value = ''; document.getElementById('input-rec').value = ''; document.getElementById('input-trabajos').value = ''; document.getElementById('input-equipos').value = ''; document.getElementById('input-tiempo').value = ''; document.getElementById('input-fotos').value = ''; document.getElementById('preview-fotos').innerHTML = '';
-            repuestosUsadosTemp = []; evidenciasBase64 = []; actualizarListaUI();
-            fetch('/api/inventario').then(res => res.json()).then(data => { const select = document.getElementById('select-uso-repuesto'); select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>'; data.forEach(r => { if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} - ${r.nombre} (Stock: ${r.cantidad_actual})</option>`; }); });
+            document.getElementById('completar-id-orden').value = id_orden;
+            
+            document.getElementById('input-obs').value = '';
+            document.getElementById('input-rec').value = '';
+            document.getElementById('input-trabajos').value = '';
+            document.getElementById('input-equipos').value = '';
+            document.getElementById('input-tiempo').value = '';
+            
+            // Limpiar área fotográfica
+            document.getElementById('input-fotos').value = '';
+            document.getElementById('preview-fotos').innerHTML = '';
+            
+            repuestosUsadosTemp = [];
+            evidenciasBase64 = [];
+            actualizarListaUI();
+            
+            fetch('/api/inventario').then(res => res.json()).then(data => {
+                const select = document.getElementById('select-uso-repuesto');
+                select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
+                data.forEach(r => {
+                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} - ${r.nombre} (Stock: ${r.cantidad_actual})</option>`;
+                });
+            });
             modalCompletar.classList.remove('hidden');
         }
+
         function cerrarModalCompletar() { modalCompletar.classList.add('hidden'); }
-        function agregarRepuestoALista() { const select = document.getElementById('select-uso-repuesto'); const cant = document.getElementById('input-uso-cant').value; if(!select.value || cant <= 0) { mostrarNotificacion("Selecciona un repuesto y cantidad válida.", 'error'); return; } repuestosUsadosTemp.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant }); actualizarListaUI(); }
-        function actualizarListaUI() { const ul = document.getElementById('lista-repuestos-usados'); if(repuestosUsadosTemp.length === 0) { ul.innerHTML = '<li class="py-2 text-sm text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; } ul.innerHTML = ''; repuestosUsadosTemp.forEach((item, index) => { ul.innerHTML += `<li class="py-2 flex justify-between items-center text-sm text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuesto(${index})" class="text-rose-500 hover:text-rose-400"><i class="fa-solid fa-xmark"></i></button></li>`; }); }
+
+        function agregarRepuestoALista() {
+            const select = document.getElementById('select-uso-repuesto');
+            const cant = document.getElementById('input-uso-cant').value;
+            if(!select.value || cant <= 0) { 
+                mostrarNotificacion("Selecciona un repuesto y cantidad válida.", 'error'); 
+                return; 
+            }
+            repuestosUsadosTemp.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
+            actualizarListaUI();
+        }
+
+        function actualizarListaUI() {
+            const ul = document.getElementById('lista-repuestos-usados');
+            if(repuestosUsadosTemp.length === 0) { ul.innerHTML = '<li class="py-2 text-sm text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; }
+            ul.innerHTML = '';
+            repuestosUsadosTemp.forEach((item, index) => {
+                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-sm text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuesto(${index})" class="text-rose-500 hover:text-rose-400"><i class="fa-solid fa-xmark"></i></button></li>`;
+            });
+        }
+        
         function quitarRepuesto(i) { repuestosUsadosTemp.splice(i, 1); actualizarListaUI(); }
 
         function procesarImagenes(event) {
-            const files = event.target.files; const previewContainer = document.getElementById('preview-fotos'); previewContainer.innerHTML = ''; evidenciasBase64 = [];
-            Array.from(files).forEach(file => { const reader = new FileReader(); reader.onload = (e) => { const b64 = e.target.result; const base64Data = b64.split(',')[1]; evidenciasBase64.push(base64Data); const img = document.createElement('img'); img.src = b64; img.className = 'w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm'; previewContainer.appendChild(img); }; reader.readAsDataURL(file); });
+            const files = event.target.files;
+            const previewContainer = document.getElementById('preview-fotos');
+            previewContainer.innerHTML = '';
+            evidenciasBase64 = [];
+
+            Array.from(files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const b64 = e.target.result;
+                    const base64Data = b64.split(',')[1];
+                    evidenciasBase64.push(base64Data);
+
+                    const img = document.createElement('img');
+                    img.src = b64;
+                    img.className = 'w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm';
+                    previewContainer.appendChild(img);
+                };
+                reader.readAsDataURL(file);
+            });
         }
 
         function confirmarCompletarOrden() {
-            const id_orden = document.getElementById('completar-id-orden').value; const obs = document.getElementById('input-obs').value || 'Sin observaciones adicionales.'; const rec = document.getElementById('input-rec').value || 'Ninguna recomendación específica.'; const trabajos = document.getElementById('input-trabajos').value || 'Trabajos de rutina.'; const equipos = document.getElementById('input-equipos').value || 'Herramientas manuales.'; const tiempo = document.getElementById('input-tiempo').value || 'No especificado.';
-            fetch(`/api/ordenes/completar/${id_orden}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repuestos: repuestosUsadosTemp, observaciones: obs, recomendaciones: rec, trabajos_realizados: trabajos, equipos_necesarios: equipos, tiempo_ejecucion: tiempo, evidencias: evidenciasBase64 }) }).then(res => res.json()).then(r => { if(r.status === 'ok') window.location.reload(); });
+            const id_orden = document.getElementById('completar-id-orden').value;
+            const obs = document.getElementById('input-obs').value || 'Sin observaciones adicionales.';
+            const rec = document.getElementById('input-rec').value || 'Ninguna recomendación específica.';
+            const trabajos = document.getElementById('input-trabajos').value || 'Trabajos de rutina.';
+            const equipos = document.getElementById('input-equipos').value || 'Herramientas manuales.';
+            const tiempo = document.getElementById('input-tiempo').value || 'No especificado.';
+            
+            fetch(`/api/ordenes/completar/${id_orden}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    repuestos: repuestosUsadosTemp, 
+                    observaciones: obs, 
+                    recomendaciones: rec, 
+                    trabajos_realizados: trabajos, 
+                    equipos_necesarios: equipos, 
+                    tiempo_ejecucion: tiempo,
+                    evidencias: evidenciasBase64
+                })
+            }).then(res => res.json()).then(r => { if(r.status === 'ok') window.location.reload(); });
         }
 
+        // HISTORIAL DE AUDITORÍA (PDF)
         function abrirModalHistorial() {
             fetch('/api/historial').then(res => res.json()).then(data => {
                 let html = '';
-                if(data.length === 0) { html = '<tr><td colspan="6" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">El historial está vacío.</td></tr>'; } 
-                else { data.forEach(h => { let codRemanHist = h.codigo_reman ? `<div class="text-[9px] text-cyan-400 font-bold mb-0.5">${h.codigo_reman}</div>` : ''; html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar-check text-emerald-500 mr-1"></i> ${h.fecha_ejecucion}</td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-800 dark:text-slate-200">${codRemanHist}${h.codigo_equipo}</td><td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${h.tipo_mantenimiento}</span></td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400">${h.tiempo_ejecucion}</td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-700 dark:text-slate-300 font-medium"><i class="fa-solid fa-user-tag text-cyan-500 mr-1"></i> ${h.tecnico_asignado}</td><td class="px-4 py-3 text-center whitespace-nowrap flex justify-center"><button onclick="descargarReportePDF(${h.id_mantenimiento})" class="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center"><i class="fa-solid fa-file-pdf mr-1.5"></i> .PDF</button></td></tr>`; }); }
-                document.getElementById('tabla-historial').innerHTML = html; document.getElementById('modal-historial').classList.remove('hidden');
+                if(data.length === 0) {
+                    html = '<tr><td colspan="6" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">El historial está vacío.</td></tr>';
+                } else {
+                    data.forEach(h => {
+                        let codRemanHist = h.codigo_reman ? `<div class="text-[9px] text-cyan-400 font-bold mb-0.5">${h.codigo_reman}</div>` : '';
+                        html += `
+                            <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors">
+                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar-check text-emerald-500 mr-1"></i> ${h.fecha_ejecucion}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-800 dark:text-slate-200">${codRemanHist}${h.codigo_equipo}</td>
+                                <td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${h.tipo_mantenimiento}</span></td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400">${h.tiempo_ejecucion}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-700 dark:text-slate-300 font-medium"><i class="fa-solid fa-user-tag text-cyan-500 mr-1"></i> ${h.tecnico_asignado}</td>
+                                <td class="px-4 py-3 text-center whitespace-nowrap flex justify-center">
+                                    <button onclick="descargarReportePDF(${h.id_mantenimiento})" class="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center">
+                                        <i class="fa-solid fa-file-pdf mr-1.5"></i> .PDF
+                                    </button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                }
+                document.getElementById('tabla-historial').innerHTML = html;
+                document.getElementById('modal-historial').classList.remove('hidden');
             });
         }
         function cerrarModalHistorial() { document.getElementById('modal-historial').classList.add('hidden'); }
-        function descargarReportePDF(id) { mostrarNotificacion("Generando Reporte PDF oficial..."); window.location.href = `/api/reporte/${id}`; }
-        function abrirModalAlertas(e) { if(e) e.stopPropagation(); document.getElementById('modal-alertas-stock').classList.remove('hidden'); }
-        function cerrarModalAlertas() { document.getElementById('modal-alertas-stock').classList.add('hidden'); }
-        function descargarInventarioExcel() { mostrarNotificacion("Descargando libro de Excel..."); window.location.href = "/api/inventario/exportar"; }
-        function descargarComprasExcel() { mostrarNotificacion("Descargando libro contable de Compras..."); window.location.href = "/api/compras/exportar"; }
         
-        window.addEventListener('click', function(e) { if (e.target.classList.contains('modal-container')) { e.target.classList.add('hidden'); } const panelAlertas = document.getElementById('modal-alertas-stock'); const btnAlertas = document.getElementById('btn-alertas-flotante'); if (panelAlertas && !panelAlertas.classList.contains('hidden') && !panelAlertas.contains(e.target) && e.target !== btnAlertas && !btnAlertas.contains(e.target)) { cerrarModalAlertas(); } });
-        window.addEventListener('keydown', function(e) { if (e.key === 'Escape' || e.key === 'Esc') { document.querySelectorAll('.modal-container').forEach(m => m.classList.add('hidden')); const mAlertas = document.getElementById('modal-alertas-stock'); if (mAlertas && !mAlertas.classList.contains('hidden')) cerrarModalAlertas(); } });
+        function descargarReportePDF(id) { 
+            mostrarNotificacion("Generando Reporte PDF oficial...");
+            window.location.href = `/api/reporte/${id}`; 
+        }
+
+        function abrirModalAlertas(e) { 
+            if(e) e.stopPropagation();
+            document.getElementById('modal-alertas-stock').classList.remove('hidden'); 
+        }
+        function cerrarModalAlertas() { document.getElementById('modal-alertas-stock').classList.add('hidden'); }
+        
+        function descargarInventarioExcel() { 
+            mostrarNotificacion("Descargando libro de Excel...");
+            window.location.href = "/api/inventario/exportar"; 
+        }
+        function descargarComprasExcel() { 
+            mostrarNotificacion("Descargando libro contable de Compras...");
+            window.location.href = "/api/compras/exportar"; 
+        }
+
+        window.addEventListener('click', function(e) {
+            if (e.target.classList.contains('modal-container')) {
+                e.target.classList.add('hidden');
+            }
+            const panelAlertas = document.getElementById('modal-alertas-stock');
+            const btnAlertas = document.getElementById('btn-alertas-flotante');
+            if (panelAlertas && !panelAlertas.classList.contains('hidden') && !panelAlertas.contains(e.target) && e.target !== btnAlertas && !btnAlertas.contains(e.target)) {
+                cerrarModalAlertas();
+            }
+        });
+
+        window.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape' || e.key === 'Esc') {
+                document.querySelectorAll('.modal-container').forEach(m => m.classList.add('hidden'));
+                const mAlertas = document.getElementById('modal-alertas-stock');
+                if (mAlertas && !mAlertas.classList.contains('hidden')) cerrarModalAlertas();
+            }
+        });
     </script>
 </body>
 </html>
@@ -1118,15 +1559,21 @@ MOBILE_MACHINE_TEMPLATE = """
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style> body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; } .toast-enter { transform: translateY(100%); opacity: 0; } .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 0.3s ease-out; } </style>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
+        .toast-enter { transform: translateY(100%); opacity: 0; }
+        .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 0.3s ease-out; }
+    </style>
 </head>
 <body class="pb-20 relative">
 
+    <!-- Toast Notification (Mobile) -->
     <div id="mobile-toast" class="fixed bottom-5 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-3 rounded-xl shadow-2xl border border-slate-700 z-[100] flex items-center w-11/12 max-w-sm toast-enter hidden">
         <i id="mobile-toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="mobile-toast-msg" class="text-sm font-semibold">Mensaje</span>
     </div>
 
+    <!-- Header Fijo -->
     <header class="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-50 shadow-lg flex justify-between items-center">
         <div class="flex flex-col">
             <span class="text-cyan-400 font-bold text-sm tracking-widest uppercase">Perfil de Máquina</span>
@@ -1138,6 +1585,7 @@ MOBILE_MACHINE_TEMPLATE = """
     </header>
 
     <div class="p-4 space-y-6">
+        <!-- 1. Tarjeta Principal de la Máquina -->
         <div class="bg-slate-900 rounded-2xl p-5 border border-slate-800 shadow-xl relative overflow-hidden">
             {% if maquina.estado == 'Operativa' %}
                 <div class="absolute left-0 top-0 bottom-0 w-1.5 bg-emerald-500"></div>
@@ -1164,10 +1612,11 @@ MOBILE_MACHINE_TEMPLATE = """
             </div>
         </div>
 
+        <!-- 2. Sección de Órdenes Pendientes -->
         <div>
             <div class="flex justify-between items-center mb-3 ml-1">
-                <h2 class="text-cyan-400 font-bold uppercase tracking-widest text-xs flex items-center">
-                    <i class="fa-solid fa-clipboard-list mr-2"></i> Tareas Pendientes
+                <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs flex items-center">
+                    <i class="fa-solid fa-clipboard-list mr-2 text-cyan-500"></i> Tareas Pendientes
                 </h2>
                 <span class="bg-slate-800 text-slate-300 text-[10px] font-bold px-2 py-1 rounded-lg">{{ ordenes|length }}</span>
             </div>
@@ -1191,6 +1640,7 @@ MOBILE_MACHINE_TEMPLATE = """
                             </div>
                             <p class="text-sm font-medium text-slate-200 mb-3">{{ orden.descripcion_tarea }}</p>
                             
+                            <!-- Botón para Completar Orden Directamente -->
                             <button onclick="abrirModalReporteMovel({{ orden.id_mantenimiento }})" class="w-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-white font-bold py-2.5 rounded-lg text-sm transition-colors border border-slate-700 flex justify-center items-center shadow-inner">
                                 <i class="fa-solid fa-file-signature mr-2 text-cyan-400"></i> Generar Reporte
                             </button>
@@ -1201,6 +1651,7 @@ MOBILE_MACHINE_TEMPLATE = """
             {% endif %}
         </div>
 
+        <!-- 3. Historial Rápido de Intervenciones -->
         <div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-3 ml-1 flex items-center">
                 <i class="fa-solid fa-clock-rotate-left mr-2 text-slate-500"></i> Últimas Intervenciones
@@ -1229,19 +1680,26 @@ MOBILE_MACHINE_TEMPLATE = """
         </div>
     </div>
 
+    <!-- MODAL MÓVIL: Formulario de Reporte Completo -->
     <div id="modal-reporte-movil" class="fixed inset-0 bg-slate-950/90 z-[60] hidden flex-col justify-end transform transition-transform duration-300 translate-y-full">
         <div class="bg-slate-900 w-full h-[95vh] rounded-t-3xl border-t border-slate-700 flex flex-col shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
-            <div class="w-full flex justify-center py-3" onclick="cerrarModalReporteMovel()"><div class="w-12 h-1.5 bg-slate-700 rounded-full"></div></div>
+            
+            <div class="w-full flex justify-center py-3" onclick="cerrarModalReporteMovel()">
+                <div class="w-12 h-1.5 bg-slate-700 rounded-full"></div>
+            </div>
             
             <div class="px-5 pb-4 border-b border-slate-800 flex justify-between items-center shrink-0">
                 <h3 class="text-lg font-bold text-white flex items-center">
                     <i class="fa-solid fa-flag-checkered text-emerald-500 mr-2"></i> Finalizar Trabajo
                 </h3>
-                <button onclick="cerrarModalReporteMovel()" class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400"><i class="fa-solid fa-xmark"></i></button>
+                <button onclick="cerrarModalReporteMovel()" class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
             </div>
             
             <div class="p-5 overflow-y-auto flex-1 space-y-4">
                 <input type="hidden" id="movil-id-orden">
+                
                 <div>
                     <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Trabajos Realizados (Descripción Detallada)</label>
                     <textarea id="movil-trabajos" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Describe paso a paso lo que se hizo..."></textarea>
@@ -1273,7 +1731,9 @@ MOBILE_MACHINE_TEMPLATE = """
                     <div class="flex space-x-2">
                         <select id="movil-select-repuesto" class="flex-1 min-w-0 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none truncate"></select>
                         <input type="number" id="movil-input-cant" value="1" min="0.1" step="0.1" class="w-16 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white text-center outline-none">
-                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold"><i class="fa-solid fa-plus"></i></button>
+                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold">
+                            <i class="fa-solid fa-plus"></i>
+                        </button>
                     </div>
                     <ul id="movil-lista-repuestos" class="mt-3 divide-y divide-slate-700/50 max-h-32 overflow-y-auto">
                         <li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>
@@ -1300,33 +1760,71 @@ MOBILE_MACHINE_TEMPLATE = """
         let repuestosUsadosMovil = [];
 
         function showMobileToast(msg, isError = false) {
-            const toast = document.getElementById('mobile-toast'); const icon = document.getElementById('mobile-toast-icon');
-            document.getElementById('mobile-toast-msg').innerText = msg; toast.classList.remove('hidden'); toast.classList.add('toast-enter-active');
-            if (isError) { toast.classList.replace('bg-slate-800', 'bg-rose-900'); toast.classList.replace('border-slate-700', 'border-rose-700'); icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg"; } 
-            else { toast.classList.replace('bg-rose-900', 'bg-slate-800'); toast.classList.replace('border-rose-700', 'border-slate-700'); icon.className = "fa-solid fa-circle-check mr-3 text-emerald-400 text-lg"; }
-            setTimeout(() => { toast.classList.remove('toast-enter-active'); setTimeout(() => toast.classList.add('hidden'), 300); }, 3000);
+            const toast = document.getElementById('mobile-toast');
+            const icon = document.getElementById('mobile-toast-icon');
+            document.getElementById('mobile-toast-msg').innerText = msg;
+            toast.classList.remove('hidden');
+            toast.classList.add('toast-enter-active');
+            
+            if (isError) {
+                toast.classList.replace('bg-slate-800', 'bg-rose-900');
+                toast.classList.replace('border-slate-700', 'border-rose-700');
+                icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
+            } else {
+                toast.classList.replace('bg-rose-900', 'bg-slate-800');
+                toast.classList.replace('border-rose-700', 'border-slate-700');
+                icon.className = "fa-solid fa-circle-check mr-3 text-emerald-400 text-lg";
+            }
+            setTimeout(() => {
+                toast.classList.remove('toast-enter-active');
+                setTimeout(() => toast.classList.add('hidden'), 300);
+            }, 3000);
         }
 
         function abrirModalReporteMovel(idOrden) {
             document.getElementById('movil-id-orden').value = idOrden;
-            document.getElementById('movil-trabajos').value = ''; document.getElementById('movil-tiempo').value = ''; document.getElementById('movil-equipos').value = ''; document.getElementById('movil-obs').value = ''; document.getElementById('movil-rec').value = ''; document.getElementById('movil-fotos').value = '';
-            const previewContainer = document.getElementById('movil-preview-container'); previewContainer.innerHTML = ''; previewContainer.classList.add('hidden');
-            evidenciasBase64Movil = []; repuestosUsadosMovil = []; actualizarListaUI();
+            
+            document.getElementById('movil-trabajos').value = '';
+            document.getElementById('movil-tiempo').value = '';
+            document.getElementById('movil-equipos').value = '';
+            document.getElementById('movil-obs').value = '';
+            document.getElementById('movil-rec').value = '';
+            document.getElementById('movil-fotos').value = '';
+            
+            const previewContainer = document.getElementById('movil-preview-container');
+            previewContainer.innerHTML = '';
+            previewContainer.classList.add('hidden');
+            
+            evidenciasBase64Movil = [];
+            repuestosUsadosMovil = [];
+            actualizarListaUI();
 
             fetch('/api/inventario').then(res => res.json()).then(data => {
                 const select = document.getElementById('movil-select-repuesto');
                 select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
-                data.forEach(r => { if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} (Stock: ${r.cantidad_actual})</option>`; });
+                data.forEach(r => {
+                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} (Stock: ${r.cantidad_actual})</option>`;
+                });
             }).catch(err => console.error("Error al cargar repuestos: ", err));
 
-            const modal = document.getElementById('modal-reporte-movil'); modal.classList.remove('hidden'); setTimeout(() => modal.classList.remove('translate-y-full'), 10);
+            const modal = document.getElementById('modal-reporte-movil');
+            modal.classList.remove('hidden');
+            setTimeout(() => modal.classList.remove('translate-y-full'), 10);
         }
 
-        function cerrarModalReporteMovel() { const modal = document.getElementById('modal-reporte-movil'); modal.classList.add('translate-y-full'); setTimeout(() => modal.classList.add('hidden'), 300); }
+        function cerrarModalReporteMovel() {
+            const modal = document.getElementById('modal-reporte-movil');
+            modal.classList.add('translate-y-full');
+            setTimeout(() => modal.classList.add('hidden'), 300);
+        }
 
         function agregarRepuestoMovil() {
-            const select = document.getElementById('movil-select-repuesto'); const cant = document.getElementById('movil-input-cant').value;
-            if(!select.value || cant <= 0) { showMobileToast("Selecciona repuesto y cantidad.", true); return; }
+            const select = document.getElementById('movil-select-repuesto');
+            const cant = document.getElementById('movil-input-cant').value;
+            if(!select.value || cant <= 0) { 
+                showMobileToast("Selecciona repuesto y cantidad.", true); 
+                return; 
+            }
             repuestosUsadosMovil.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
             actualizarListaUI();
         }
@@ -1335,21 +1833,75 @@ MOBILE_MACHINE_TEMPLATE = """
             const ul = document.getElementById('movil-lista-repuestos');
             if(repuestosUsadosMovil.length === 0) { ul.innerHTML = '<li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; }
             ul.innerHTML = '';
-            repuestosUsadosMovil.forEach((item, index) => { ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded"><i class="fa-solid fa-xmark"></i></button></li>`; });
+            repuestosUsadosMovil.forEach((item, index) => {
+                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded"><i class="fa-solid fa-xmark"></i></button></li>`;
+            });
         }
 
         function quitarRepuestoMovil(i) { repuestosUsadosMovil.splice(i, 1); actualizarListaUI(); }
 
         function previewMobileImages(event) {
-            const files = event.target.files; const previewContainer = document.getElementById('movil-preview-container'); previewContainer.innerHTML = ''; evidenciasBase64Movil = [];
-            if(files.length > 0) previewContainer.classList.remove('hidden'); else previewContainer.classList.add('hidden');
-            Array.from(files).forEach(file => { const reader = new FileReader(); reader.onload = (e) => { const b64 = e.target.result; evidenciasBase64Movil.push(b64.split(',')[1]); const img = document.createElement('img'); img.src = b64; img.className = 'w-full h-24 object-cover rounded-xl border border-slate-700'; previewContainer.appendChild(img); }; reader.readAsDataURL(file); });
+            const files = event.target.files;
+            const previewContainer = document.getElementById('movil-preview-container');
+            previewContainer.innerHTML = '';
+            evidenciasBase64Movil = [];
+
+            if(files.length > 0) previewContainer.classList.remove('hidden');
+            else previewContainer.classList.add('hidden');
+
+            Array.from(files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const b64 = e.target.result;
+                    evidenciasBase64Movil.push(b64.split(',')[1]);
+                    
+                    const img = document.createElement('img');
+                    img.src = b64;
+                    img.className = 'w-full h-24 object-cover rounded-xl border border-slate-700';
+                    previewContainer.appendChild(img);
+                };
+                reader.readAsDataURL(file);
+            });
         }
 
         function enviarReporteMovil() {
-            const idOrden = document.getElementById('movil-id-orden').value; const btn = document.getElementById('btn-enviar-movil'); btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Guardando...'; btn.disabled = true;
-            const payload = { repuestos: repuestosUsadosMovil, observaciones: document.getElementById('movil-obs').value || 'Sin observaciones.', recomendaciones: document.getElementById('movil-rec').value || 'Ninguna recomendación.', trabajos_realizados: document.getElementById('movil-trabajos').value || 'Trabajo completado.', equipos_necesarios: document.getElementById('movil-equipos').value || 'Herramientas estándar.', tiempo_ejecucion: document.getElementById('movil-tiempo').value || 'No especificado', evidencias: evidenciasBase64Movil };
-            fetch(`/api/ordenes/completar/${idOrden}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(res => res.json()).then(r => { if(r.status === 'ok') { showMobileToast('Reporte guardado exitosamente.'); cerrarModalReporteMovel(); setTimeout(() => window.location.reload(), 1000); } else { showMobileToast('Error al guardar reporte.', true); btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo'; btn.disabled = false; } }).catch(err => { showMobileToast('Error de conexión.', true); btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo'; btn.disabled = false; });
+            const idOrden = document.getElementById('movil-id-orden').value;
+            const btn = document.getElementById('btn-enviar-movil');
+            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Guardando...';
+            btn.disabled = true;
+
+            const payload = {
+                repuestos: repuestosUsadosMovil,
+                observaciones: document.getElementById('movil-obs').value || 'Sin observaciones.',
+                recomendaciones: document.getElementById('movil-rec').value || 'Ninguna recomendación.',
+                trabajos_realizados: document.getElementById('movil-trabajos').value || 'Trabajo completado.',
+                equipos_necesarios: document.getElementById('movil-equipos').value || 'Herramientas estándar.',
+                tiempo_ejecucion: document.getElementById('movil-tiempo').value || 'No especificado',
+                evidencias: evidenciasBase64Movil
+            };
+
+            fetch(`/api/ordenes/completar/${idOrden}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(res => res.json())
+            .then(r => {
+                if(r.status === 'ok') {
+                    showMobileToast('Reporte guardado exitosamente.');
+                    cerrarModalReporteMovel();
+                    setTimeout(() => window.location.reload(), 1000);
+                } else {
+                    showMobileToast('Error al guardar reporte.', true);
+                    btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo';
+                    btn.disabled = false;
+                }
+            })
+            .catch(err => {
+                showMobileToast('Error de conexión.', true);
+                btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo';
+                btn.disabled = false;
+            });
         }
     </script>
 </body>
@@ -1367,55 +1919,179 @@ MONITOR_TEMPLATE = """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Rajdhani:wght@700&display=swap" rel="stylesheet">
-    <style> body { font-family: 'Inter', sans-serif; background-color: #020617; color: white; overflow: hidden; } .fuente-logo { font-family: 'Rajdhani', sans-serif; } </style>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #020617; color: white; overflow: hidden; }
+        .fuente-logo { font-family: 'Rajdhani', sans-serif; }
+    </style>
 </head>
 <body class="flex flex-col h-screen p-4 gap-4">
     <header class="flex justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-2xl shrink-0">
         <div class="flex items-center">
-            <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]"><span class="text-cyan-400 font-bold text-4xl fuente-logo tracking-wider">CAFE</span><span class="text-white font-bold text-4xl fuente-logo tracking-wider ml-1">TEC</span></div>
-            <span class="ml-6 pl-6 border-l-2 border-slate-700 text-slate-400 uppercase tracking-widest font-bold text-lg flex items-center"><i class="fa-solid fa-tower-broadcast text-rose-500 animate-pulse mr-3"></i> Monitor en Tiempo Real</span>
+            <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]">
+                <span class="text-cyan-400 font-bold text-4xl fuente-logo tracking-wider">CAFE</span>
+                <span class="text-white font-bold text-4xl fuente-logo tracking-wider ml-1">TEC</span>
+            </div>
+            <span class="ml-6 pl-6 border-l-2 border-slate-700 text-slate-400 uppercase tracking-widest font-bold text-lg flex items-center">
+                <i class="fa-solid fa-tower-broadcast text-rose-500 animate-pulse mr-3"></i> Monitor en Tiempo Real
+            </span>
         </div>
-        <div class="text-right flex flex-col items-end"><div id="reloj" class="text-4xl font-black text-white tracking-widest font-mono drop-shadow-md">00:00:00</div><div id="fecha" class="text-cyan-400 text-sm font-bold uppercase mt-1">---</div></div>
+        <div class="text-right flex flex-col items-end">
+            <div id="reloj" class="text-4xl font-black text-white tracking-widest font-mono drop-shadow-md">00:00:00</div>
+            <div id="fecha" class="text-cyan-400 text-sm font-bold uppercase mt-1">---</div>
+        </div>
     </header>
+
     <main class="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
         <div class="flex flex-col gap-4 min-h-0">
             <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center items-center text-center relative overflow-hidden">
-                <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div><div class="absolute top-4 left-4 flex items-center text-slate-500 text-xs font-bold uppercase tracking-widest"><i class="fa-solid fa-circle-dot mr-2"></i> Estatus Planta</div><div id="estado-texto" class="text-[3.5rem] leading-none font-black text-emerald-400 z-10 transition-colors duration-1000 mt-4">OPERATIVA</div>
+                <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div>
+                <div class="absolute top-4 left-4 flex items-center text-slate-500 text-xs font-bold uppercase tracking-widest">
+                    <i class="fa-solid fa-circle-dot mr-2"></i> Estatus Planta
+                </div>
+                <div id="estado-texto" class="text-[3.5rem] leading-none font-black text-emerald-400 z-10 transition-colors duration-1000 mt-4">OPERATIVA</div>
             </div>
+            
             <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center">
                 <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-6 text-sm"><i class="fa-solid fa-list-check mr-2"></i> Progreso de Órdenes (Hoy)</h2>
-                <div class="flex justify-between items-end mb-4"><div><span class="text-[3.5rem] leading-none font-black text-white" id="ordenes-progreso">0/0</span><span class="text-slate-500 font-bold ml-2 uppercase text-sm">Completadas</span></div><span class="text-cyan-400 font-black text-4xl" id="ordenes-porcentaje">0%</span></div>
-                <div class="w-full bg-slate-950 rounded-full h-6 border border-slate-800 overflow-hidden shadow-inner"><div class="bg-cyan-500 h-full rounded-full transition-all duration-1000 relative overflow-hidden" id="barra-progreso" style="width: 0%"><div class="absolute inset-0 bg-white/20 w-full h-full" style="background-image: linear-gradient(45deg,rgba(255,255,255,.15) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.15) 50%,rgba(255,255,255,.15) 75%,transparent 75%,transparent); background-size: 1rem 1rem;"></div></div></div>
+                <div class="flex justify-between items-end mb-4">
+                    <div>
+                        <span class="text-[3.5rem] leading-none font-black text-white" id="ordenes-progreso">0/0</span>
+                        <span class="text-slate-500 font-bold ml-2 uppercase text-sm">Completadas</span>
+                    </div>
+                    <span class="text-cyan-400 font-black text-4xl" id="ordenes-porcentaje">0%</span>
+                </div>
+                <div class="w-full bg-slate-950 rounded-full h-6 border border-slate-800 overflow-hidden shadow-inner">
+                    <div class="bg-cyan-500 h-full rounded-full transition-all duration-1000 relative overflow-hidden" id="barra-progreso" style="width: 0%">
+                        <div class="absolute inset-0 bg-white/20 w-full h-full" style="background-image: linear-gradient(45deg,rgba(255,255,255,.15) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.15) 50%,rgba(255,255,255,.15) 75%,transparent 75%,transparent); background-size: 1rem 1rem;"></div>
+                    </div>
+                </div>
             </div>
         </div>
+
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col items-center relative overflow-hidden min-h-0">
-            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div><h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0"><i class="fa-solid fa-chart-pie mr-2"></i> Disponibilidad de Equipos</h2>
-            <div class="flex-1 w-full relative flex items-center justify-center min-h-0"><div class="relative w-full h-full max-h-64 flex justify-center items-center"><canvas id="chartDisponibilidad"></canvas><div class="absolute inset-0 flex items-center justify-center pointer-events-none flex-col mt-4"><span class="text-6xl font-black text-white drop-shadow-lg" id="disp-porcentaje">100%</span><span class="text-sm text-emerald-400 font-bold uppercase tracking-widest mt-1">Online</span></div></div></div>
-            <div class="w-full mt-4 flex justify-center space-x-6 shrink-0"><div class="flex items-center"><span class="w-4 h-4 rounded-full bg-emerald-500 mr-2 shadow-[0_0_10px_rgba(16,185,129,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">Operativas</span></div><div class="flex items-center"><span class="w-4 h-4 rounded-full bg-rose-600 mr-2 shadow-[0_0_10px_rgba(225,29,72,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">En Mantenimiento</span></div></div>
+            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div>
+            <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0">
+                <i class="fa-solid fa-chart-pie mr-2"></i> Disponibilidad de Equipos
+            </h2>
+            <div class="flex-1 w-full relative flex items-center justify-center min-h-0">
+                <div class="relative w-full h-full max-h-64 flex justify-center items-center">
+                    <canvas id="chartDisponibilidad"></canvas>
+                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none flex-col mt-4">
+                        <span class="text-6xl font-black text-white drop-shadow-lg" id="disp-porcentaje">100%</span>
+                        <span class="text-sm text-emerald-400 font-bold uppercase tracking-widest mt-1">Online</span>
+                    </div>
+                </div>
+            </div>
+            <div class="w-full mt-4 flex justify-center space-x-6 shrink-0">
+                <div class="flex items-center"><span class="w-4 h-4 rounded-full bg-emerald-500 mr-2 shadow-[0_0_10px_rgba(16,185,129,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">Operativas</span></div>
+                <div class="flex items-center"><span class="w-4 h-4 rounded-full bg-rose-600 mr-2 shadow-[0_0_10px_rgba(225,29,72,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">En Mantenimiento</span></div>
+            </div>
         </div>
+
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col relative overflow-hidden min-h-0">
-            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div><h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0"><span><i class="fa-solid fa-triangle-exclamation mr-2"></i> Equipos Detenidos</span><span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span></h2>
-            <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos"><div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50"><i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i><p class="font-bold text-lg">Todos los equipos operativos</p></div></div>
+            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div>
+            <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0">
+                <span><i class="fa-solid fa-triangle-exclamation mr-2"></i> Equipos Detenidos</span>
+                <span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span>
+            </h2>
+            <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos">
+                <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50">
+                    <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
+                    <p class="font-bold text-lg">Todos los equipos operativos</p>
+                </div>
+            </div>
         </div>
     </main>
+
     <script>
-        function actualizarReloj() { const ahora = new Date(); document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false }); const opciones = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }; let fechaStr = ahora.toLocaleDateString('es-ES', opciones); document.getElementById('fecha').textContent = fechaStr; } setInterval(actualizarReloj, 1000); actualizarReloj();
-        let chartDisp = null;
-        function actualizarDatos() {
-            fetch('/api/monitor_data').then(r => r.json()).then(d => {
-                const totOrd = d.ordenes.total; const compOrd = d.ordenes.completadas; document.getElementById('ordenes-progreso').textContent = `${compOrd}/${totOrd}`; let pctOrd = 100; if(totOrd > 0) pctOrd = Math.round((compOrd / totOrd) * 100);
-                const countUp = (id, target) => { document.getElementById(id).textContent = target + '%'; }; countUp('ordenes-porcentaje', pctOrd); document.getElementById('barra-progreso').style.width = `${pctOrd}%`;
-                const totMaq = d.maquinas.total; const opMaq = d.maquinas.operativas; const detMaq = d.maquinas.detenidas;
-                let estadoGlobal = 'OPERATIVA'; let colorEstado = 'emerald'; if(detMaq.length > 0 && detMaq.length < totMaq) { estadoGlobal = 'OP. PARCIAL'; colorEstado = 'amber'; } else if(detMaq.length === totMaq && totMaq > 0) { estadoGlobal = 'PARADA GENERAL'; colorEstado = 'rose'; }
-                const bgEstado = document.getElementById('bg-estado'); const txtEstado = document.getElementById('estado-texto'); bgEstado.className = `absolute inset-0 opacity-10 bg-${colorEstado}-500 transition-colors duration-1000`; txtEstado.className = `text-[3.5rem] leading-none font-black text-${colorEstado}-400 z-10 transition-colors duration-1000 mt-4`; txtEstado.textContent = estadoGlobal;
-                let pctDisp = 100; if(totMaq > 0) pctDisp = Math.round((opMaq / totMaq) * 100); countUp('disp-porcentaje', pctDisp);
-                if(!chartDisp) { const ctx = document.getElementById('chartDisponibilidad').getContext('2d'); chartDisp = new Chart(ctx, { type: 'doughnut', data: { labels: ['Operativas', 'Detenidas'], datasets: [{ data: [opMaq, detMaq.length], backgroundColor: ['#10B981', '#E11D48'], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, cutout: '80%', plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateScale: true } } }); } else { chartDisp.data.datasets[0].data = [opMaq, detMaq.length]; chartDisp.update(); }
-                document.getElementById('badge-detenidos').textContent = detMaq.length; const lista = document.getElementById('lista-detenidos');
-                if(detMaq.length === 0) { lista.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500"><i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i><p class="font-bold text-lg">Todos los equipos operativos</p></div>`; } 
-                else { lista.innerHTML = detMaq.map(m => `<div class="bg-slate-950 border-l-4 border-rose-500 rounded-lg p-4 shadow-md flex items-center justify-between transform transition-all duration-300 hover:scale-105"><div><div class="font-black text-rose-400 text-lg tracking-wider">${m.codigo_equipo}</div><div class="text-slate-300 font-medium truncate w-48 text-sm">${m.nombre}</div></div><div class="w-10 h-10 rounded-full bg-rose-900/30 flex items-center justify-center text-rose-500 animate-pulse"><i class="fa-solid fa-wrench"></i></div></div>`).join(''); }
-            }).catch(err => console.error("Error en monitor:", err));
+        function actualizarReloj() {
+            const ahora = new Date();
+            document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
+            const opciones = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+            let fechaStr = ahora.toLocaleDateString('es-ES', opciones);
+            document.getElementById('fecha').textContent = fechaStr;
         }
-        setInterval(actualizarDatos, 5000); actualizarDatos();
+        setInterval(actualizarReloj, 1000);
+        actualizarReloj();
+
+        let chartDisp = null;
+
+        function actualizarDatos() {
+            fetch('/api/monitor_data')
+                .then(r => r.json())
+                .then(d => {
+                    const totOrd = d.ordenes.total;
+                    const compOrd = d.ordenes.completadas;
+                    document.getElementById('ordenes-progreso').textContent = `${compOrd}/${totOrd}`;
+                    let pctOrd = 100;
+                    if(totOrd > 0) pctOrd = Math.round((compOrd / totOrd) * 100);
+                    
+                    const countUp = (id, target) => {
+                        document.getElementById(id).textContent = target + '%';
+                    };
+                    countUp('ordenes-porcentaje', pctOrd);
+                    document.getElementById('barra-progreso').style.width = `${pctOrd}%`;
+
+                    const totMaq = d.maquinas.total;
+                    const opMaq = d.maquinas.operativas;
+                    const detMaq = d.maquinas.detenidas;
+                    
+                    let estadoGlobal = 'OPERATIVA';
+                    let colorEstado = 'emerald';
+                    if(detMaq.length > 0 && detMaq.length < totMaq) { estadoGlobal = 'OP. PARCIAL'; colorEstado = 'amber'; }
+                    else if(detMaq.length === totMaq && totMaq > 0) { estadoGlobal = 'PARADA GENERAL'; colorEstado = 'rose'; }
+                    
+                    const bgEstado = document.getElementById('bg-estado');
+                    const txtEstado = document.getElementById('estado-texto');
+                    
+                    bgEstado.className = `absolute inset-0 opacity-10 bg-${colorEstado}-500 transition-colors duration-1000`;
+                    txtEstado.className = `text-[3.5rem] leading-none font-black text-${colorEstado}-400 z-10 transition-colors duration-1000 mt-4`;
+                    txtEstado.textContent = estadoGlobal;
+
+                    let pctDisp = 100;
+                    if(totMaq > 0) pctDisp = Math.round((opMaq / totMaq) * 100);
+                    countUp('disp-porcentaje', pctDisp);
+
+                    if(!chartDisp) {
+                        const ctx = document.getElementById('chartDisponibilidad').getContext('2d');
+                        chartDisp = new Chart(ctx, {
+                            type: 'doughnut',
+                            data: { labels: ['Operativas', 'Detenidas'], datasets: [{ data: [opMaq, detMaq.length], backgroundColor: ['#10B981', '#E11D48'], borderWidth: 0 }] },
+                            options: { responsive: true, maintainAspectRatio: false, cutout: '80%', plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateScale: true } }
+                        });
+                    } else {
+                        chartDisp.data.datasets[0].data = [opMaq, detMaq.length];
+                        chartDisp.update();
+                    }
+
+                    document.getElementById('badge-detenidos').textContent = detMaq.length;
+                    const lista = document.getElementById('lista-detenidos');
+                    if(detMaq.length === 0) {
+                        lista.innerHTML = `
+                            <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500">
+                                <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
+                                <p class="font-bold text-lg">Todos los equipos operativos</p>
+                            </div>
+                        `;
+                    } else {
+                        lista.innerHTML = detMaq.map(m => `
+                            <div class="bg-slate-950 border-l-4 border-rose-500 rounded-lg p-4 shadow-md flex items-center justify-between transform transition-all duration-300 hover:scale-105">
+                                <div>
+                                    <div class="font-black text-rose-400 text-lg tracking-wider">${m.codigo_equipo}</div>
+                                    <div class="text-slate-300 font-medium truncate w-48 text-sm">${m.nombre}</div>
+                                </div>
+                                <div class="w-10 h-10 rounded-full bg-rose-900/30 flex items-center justify-center text-rose-500 animate-pulse">
+                                    <i class="fa-solid fa-wrench"></i>
+                                </div>
+                            </div>
+                        `).join('');
+                    }
+                })
+                .catch(err => console.error("Error en monitor:", err));
+        }
+
+        setInterval(actualizarDatos, 5000);
+        actualizarDatos();
     </script>
 </body>
 </html>
@@ -1446,6 +2122,7 @@ def login():
             return redirect(url_for('dashboard'))
             
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
+    
     return render_template_string(LOGIN_TEMPLATE, error=None, next_url=next_url)
 
 @app.route('/logout')
@@ -1742,10 +2419,12 @@ def api_descargar_reporte(id_orden):
     elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
     elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
     
+    # --- CAMBIO A SOLICITUD: APARTADO 3 AHORA ES OBSERVACIONES ---
     elements.append(Paragraph("3. OBSERVACIONES:", title_style))
     obs_formateado = formatear_texto_multilinea(orden['observaciones'])
     elements.append(Paragraph(obs_formateado, normal_style))
     
+    # --- CAMBIO A SOLICITUD: APARTADO 4 AHORA ES TRABAJOS REALIZADOS ---
     elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
     trabajos_formateado = formatear_texto_multilinea(orden['trabajos_realizados'])
     elements.append(Paragraph(trabajos_formateado, normal_style))
