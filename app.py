@@ -107,10 +107,16 @@ def migrar_base_datos():
     if cursor.fetchone()[0] == 0:
         usuarios_defecto = [('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('tec123'), 'Juan Pérez', 'Tecnico')]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
+    
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
+    
+    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT UNIQUE, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
+    
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
+    
+    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT UNIQUE")
+    except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN recomendaciones TEXT DEFAULT 'Ninguna.'")
@@ -140,7 +146,7 @@ def obtener_todas_las_maquinas():
 
 def obtener_mantenimientos_pendientes():
     conn = get_db_connection()
-    query = "SELECT c.id_mantenimiento, m.codigo_equipo, m.nombre AS maquina_nombre, c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_programada, c.estado_orden, c.tecnico_asignado, c.id_maquina FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.estado_orden IN ('Pendiente', 'En Progreso') ORDER BY c.fecha_programada ASC"
+    query = "SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_programada, c.estado_orden, c.tecnico_asignado, c.id_maquina FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.estado_orden IN ('Pendiente', 'En Progreso') ORDER BY c.fecha_programada ASC"
     ordenes = conn.execute(query).fetchall()
     conn.close()
     return [dict(ix) for ix in ordenes]
@@ -174,16 +180,35 @@ def registrar_compra_db(id_repuesto, cantidad, costo, proveedor, factura):
     finally:
         conn.close()
 
-def obtener_historial_compras_db():
+def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_reman_manual=None):
     conn = get_db_connection()
-    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
-    compras = conn.execute(query).fetchall()
-    conn.close()
-    return [dict(ix) for ix in compras]
+    
+    codigo_final = ""
+    if codigo_reman_manual and str(codigo_reman_manual).strip():
+        # Si el usuario forzó un código (ej. 280), construimos "RE MAN-280"
+        if not str(codigo_reman_manual).upper().startswith("RE MAN-"):
+            codigo_final = f"RE MAN-{str(codigo_reman_manual).strip()}"
+        else:
+            codigo_final = str(codigo_reman_manual).strip().upper()
+    else:
+        # Autogeneración secuencial basada en el último código ingresado
+        cursor = conn.cursor()
+        cursor.execute("SELECT codigo_reman FROM Calendario_Mantenimiento WHERE codigo_reman LIKE 'RE MAN-%' ORDER BY id_mantenimiento DESC LIMIT 1")
+        ultimo = cursor.fetchone()
+        
+        if ultimo and ultimo['codigo_reman']:
+            try:
+                partes = ultimo['codigo_reman'].split('-')
+                numero_actual = int(partes[1])
+                nuevo_numero = numero_actual + 1
+                codigo_final = f"RE MAN-{nuevo_numero}"
+            except (IndexError, ValueError):
+                codigo_final = "RE MAN-100"
+        else:
+            codigo_final = "RE MAN-100"
 
-def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico):
-    conn = get_db_connection()
-    conn.execute("INSERT INTO Calendario_Mantenimiento (id_maquina, tipo_mantenimiento, descripcion_tarea, fecha_programada, tecnico_asignado, estado_orden) VALUES (?, ?, ?, ?, ?, 'Pendiente')", (id_maquina, tipo, descripcion, fecha, tecnico))
+    conn.execute("INSERT INTO Calendario_Mantenimiento (codigo_reman, id_maquina, tipo_mantenimiento, descripcion_tarea, fecha_programada, tecnico_asignado, estado_orden) VALUES (?, ?, ?, ?, ?, ?, 'Pendiente')", (codigo_final, id_maquina, tipo, descripcion, fecha, tecnico))
+    
     hoy = datetime.now().strftime('%Y-%m-%d')
     if fecha <= hoy:
         conn.execute("UPDATE Maquinas SET estado = 'En Mantenimiento' WHERE id_maquina = ?", (id_maquina,))
@@ -225,7 +250,7 @@ def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, e
 
 def obtener_historial_db():
     conn = get_db_connection()
-    query = "SELECT c.id_mantenimiento, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta, c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_ejecucion, c.tecnico_asignado, c.tiempo_ejecucion, (SELECT GROUP_CONCAT(ro.cantidad_usada || ' ' || rs.unidad_medida || ' de ' || rs.nombre, '\n') FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = c.id_mantenimiento) as repuestos_usados FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.estado_orden = 'Completada' ORDER BY c.fecha_ejecucion DESC"
+    query = "SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta, c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_ejecucion, c.tecnico_asignado, c.tiempo_ejecucion, (SELECT GROUP_CONCAT(ro.cantidad_usada || ' ' || rs.unidad_medida || ' de ' || rs.nombre, '\n') FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = c.id_mantenimiento) as repuestos_usados FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.estado_orden = 'Completada' ORDER BY c.fecha_ejecucion DESC"
     historial = conn.execute(query).fetchall()
     conn.close()
     return [dict(ix) for ix in historial]
@@ -236,6 +261,14 @@ def crear_maquina_db(codigo, nombre, area, criticidad):
     conn.execute("INSERT INTO Maquinas (codigo_equipo, nombre, area_planta, criticidad, estado, fecha_instalacion) VALUES (?, ?, ?, ?, 'Operativa', ?)", (codigo, nombre, area, criticidad, hoy))
     conn.commit()
     conn.close()
+
+def obtener_historial_compras_db():
+    conn = get_db_connection()
+    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
+    compras = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(ix) for ix in compras]
+
 
 # ==========================================
 # 2. INTERFACES DE USUARIO HTML (TEMPLATES)
@@ -320,47 +353,34 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cafetec - Sistema de Mantenimiento</title>
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = { darkMode: 'class', theme: { extend: {} } }
     </script>
-    <!-- FontAwesome Icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
-    <!-- Google Fonts: Inter para textos y Rajdhani para el Logotipo Industrial -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
     
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
-        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
-        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
-        
-        /* Ocultar flechas de inputs numéricos */
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
 </head>
 <body class="bg-slate-50 dark:bg-slate-950 antialiased text-slate-800 dark:text-slate-200 relative transition-colors duration-300">
 
-    <!-- Variables Globales desde Flask (Autorización) -->
     <script>
         const CURRENT_USER = "{{ session.get('nombre_completo', 'Usuario') }}";
         const CURRENT_ROLE = "{{ session.get('rol', 'Tecnico') }}";
     </script>
 
-    <!-- Notificación Flotante Personalizada -->
     <div id="toast-notificacion" class="fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform translate-x-[150%] transition-transform duration-300 z-[100] border-l-4 border-cyan-500 font-bold flex items-center">
         <i id="toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="toast-msg">Mensaje</span>
@@ -383,17 +403,14 @@ HTML_TEMPLATE = """
                 </div>
                 
                 <div class="flex items-center space-x-4">
-                    <!-- BOTÓN MONITOR -->
                     <a href="/monitor" target="_blank" class="hidden sm:flex text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg items-center shadow-inner font-bold text-xs" title="Abrir Monitor de Planta">
                         <i class="fa-solid fa-display mr-2"></i> Monitor
                     </a>
 
-                    <!-- Botón Tema Oscuro/Claro -->
                     <button onclick="toggleTheme()" class="text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 p-2.5 rounded-full w-10 h-10 flex justify-center items-center shadow-inner" title="Cambiar Tema">
                         <i id="theme-icon" class="fa-solid fa-sun"></i>
                     </button>
 
-                    <!-- Panel de Usuario y Logout -->
                     <div class="text-sm font-medium bg-slate-900 pl-4 pr-2 py-1.5 rounded-full border border-slate-800 shadow-inner flex items-center text-slate-200">
                         <div class="flex flex-col text-right mr-3 leading-tight hidden sm:flex">
                             <span class="font-bold text-white text-[11px]">{{ session.get('nombre_completo', 'Usuario') }}</span>
@@ -414,7 +431,6 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
-        <!-- Tarjetas de Resumen (KPIs) - ESTILO COMPACTO -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
                 <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
@@ -456,7 +472,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Gráficos de Estado (Chart.js) COMPACTOS -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
                 <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
@@ -477,9 +492,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TABLAS PRINCIPALES -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
-            <!-- 1. Tabla de Órdenes -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
                 <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                     <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -508,7 +521,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- 2. Tabla de Máquinas -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
                 <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                     <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -539,7 +551,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- 3. Inventario y Almacén -->
         <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col mb-8">
             <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                 <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -553,7 +564,6 @@ HTML_TEMPLATE = """
                     <button id="btn-historial-compras" onclick="abrirModalCompras()" class="bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 dark:hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-sm flex items-center">
                         <i class="fa-solid fa-receipt mr-1.5"></i> Compras
                     </button>
-                    <!-- EXPORTAR A EXCEL BOTÓN -->
                     <button onclick="descargarInventarioExcel()" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-sm flex items-center">
                         <i class="fa-solid fa-file-excel mr-1.5"></i> Exportar
                     </button>
@@ -575,7 +585,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Programar/Editar Orden -->
         <div id="modal-orden" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 id="modal-orden-title" class="text-xl font-bold mb-5 text-white flex items-center">
@@ -583,6 +592,18 @@ HTML_TEMPLATE = """
                 </h2>
                 <form id="form-nueva-orden" onsubmit="guardarOrden(event)">
                     <input type="hidden" id="orden-id">
+                    
+                    <div class="mb-4 bg-slate-950 p-3 rounded-lg border border-slate-800" id="contenedor-reman">
+                        <label class="block text-xs font-bold text-cyan-400 uppercase mb-1" title="Si lo dejas en blanco, el sistema generará el siguiente código automáticamente.">
+                            <i class="fa-solid fa-barcode mr-1"></i> Forzar Código RE MAN (Opcional)
+                        </label>
+                        <div class="flex items-center">
+                            <span class="text-slate-500 font-bold mr-2 text-sm">RE MAN -</span>
+                            <input type="number" id="input-reman-manual" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 text-white" placeholder="Ej: 280">
+                        </div>
+                        <p class="text-[9px] text-slate-500 mt-1">Usa esto solo si deseas saltar la numeración y empezar desde un número específico.</p>
+                    </div>
+
                     <div class="mb-4">
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Máquina</label>
                         <select id="select-maquina" required class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white truncate"></select>
@@ -615,7 +636,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Registrar Máquina -->
         <div id="modal-maquina" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center">
@@ -656,17 +676,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Ingreso de Mercadería (Compras) -->
         <div id="modal-compra" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-2 text-white flex items-center">
                     <i class="fa-solid fa-truck-ramp-box text-cyan-400 mr-2"></i> Ingreso de Mercadería
                 </h2>
                 <p id="compra-subtitulo" class="text-sm text-slate-400 mb-5 pb-3 border-b border-slate-800 font-medium">Repuesto Seleccionado</p>
-                
                 <form id="form-registro-compra" onsubmit="guardarCompra(event)">
                     <input type="hidden" id="compra-id-repuesto">
-                    
                     <div class="grid grid-cols-2 gap-4 mb-4">
                         <div>
                             <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Cantidad Recibida</label>
@@ -677,17 +694,14 @@ HTML_TEMPLATE = """
                             <input type="number" id="compra-costo" required min="0" step="0.01" class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: 15.50">
                         </div>
                     </div>
-                    
                     <div class="mb-4">
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Proveedor / Tienda</label>
                         <input type="text" id="compra-proveedor" required class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: Ferretería Industrial">
                     </div>
-                    
                     <div class="mb-6">
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-1">N° Factura / Boleta / OC</label>
                         <input type="text" id="compra-factura" required class="w-full border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-800 text-white" placeholder="Ej: F001-4589">
                     </div>
-
                     <div class="flex justify-end space-x-3 pt-4 border-t border-slate-700">
                         <button type="button" onclick="cerrarModalCompra()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
                         <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
@@ -698,53 +712,44 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Completar Orden y Generar Reporte (ESCRITORIO) -->
         <div id="modal-completar" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-start pt-10 pb-10 backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-2xl relative border border-slate-700 my-auto modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center border-b border-slate-800 pb-3">
                     <i class="fa-solid fa-file-signature text-cyan-400 mr-2"></i> Generar Reporte Técnico
                 </h2>
-                
                 <input type="hidden" id="completar-id-orden">
-                
                 <div class="mb-4">
                     <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Trabajos Realizados (Descripción Detallada)</label>
-                    <textarea id="input-trabajos" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="Describe paso a paso lo que se hizo durante el mantenimiento..."></textarea>
+                    <textarea id="input-trabajos" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
                 </div>
-
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Equipos/Herramientas Necesarios</label>
-                        <input type="text" id="input-equipos" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600" placeholder="Ej: Multímetro, hidrolavadora, andamios..">
+                        <input type="text" id="input-equipos" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600">
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Tiempo de Ejecución</label>
-                        <input type="text" id="input-tiempo" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600" placeholder="Ej: 2 horas, 45 min...">
+                        <input type="text" id="input-tiempo" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600">
                     </div>
                 </div>
-                
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4 pt-4 border-t border-slate-800">
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Observaciones Encontradas</label>
-                        <textarea id="input-obs" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="¿Qué fallas o detalles encontraste?"></textarea>
+                        <textarea id="input-obs" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Recomendaciones Futuras</label>
-                        <textarea id="input-rec" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="Ej: Cambiar filtro el próximo mes..."></textarea>
+                        <textarea id="input-rec" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
                     </div>
                 </div>
-
                 <div class="mb-4 bg-slate-800/50 p-4 rounded-lg border border-slate-700">
                     <label class="block text-xs font-bold text-cyan-400 uppercase mb-2"><i class="fa-solid fa-box-open mr-1"></i> Repuestos Utilizados</label>
                     <div class="flex space-x-2">
                         <select id="select-uso-repuesto" class="flex-1 min-w-0 flex-shrink-0 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white truncate"></select>
                         <input type="number" id="input-uso-cant" value="1" min="0.1" step="0.1" class="w-20 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white" placeholder="Cant.">
-                        <button type="button" onclick="agregarRepuestoALista()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 rounded-lg font-bold transition-colors">
-                            <i class="fa-solid fa-plus"></i>
-                        </button>
+                        <button type="button" onclick="agregarRepuestoALista()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 rounded-lg font-bold transition-colors"><i class="fa-solid fa-plus"></i></button>
                     </div>
                 </div>
-
                 <div class="mb-6">
                     <div class="bg-slate-950 border border-slate-800 rounded-lg max-h-32 overflow-y-auto p-2">
                         <ul id="lista-repuestos-usados" class="divide-y divide-slate-800">
@@ -752,13 +757,11 @@ HTML_TEMPLATE = """
                         </ul>
                     </div>
                 </div>
-
                 <div class="mb-4 pt-4 border-t border-slate-800">
                     <label class="block text-xs font-bold text-slate-400 uppercase mb-2"><i class="fa-solid fa-camera mr-1"></i> Evidencia Fotográfica</label>
                     <input type="file" id="input-fotos" multiple accept="image/*" class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-cyan-900/50 file:text-cyan-400 hover:file:bg-cyan-900 transition-colors bg-slate-950 border border-slate-800 rounded-lg cursor-pointer" onchange="procesarImagenes(event)">
                     <div id="preview-fotos" class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3"></div>
                 </div>
-
                 <div class="flex justify-end space-x-3 pt-4 border-t border-slate-800">
                     <button type="button" onclick="cerrarModalCompletar()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
                     <button type="button" onclick="confirmarCompletarOrden()" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
@@ -768,7 +771,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Historial de Auditoría (PDF) -->
         <div id="modal-historial" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -779,7 +781,6 @@ HTML_TEMPLATE = """
                         <i class="fa-solid fa-xmark text-2xl"></i>
                     </button>
                 </div>
-                
                 <div class="overflow-y-auto flex-1 bg-slate-50 dark:bg-slate-900 p-4">
                     <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
                         <thead class="bg-slate-900 sticky top-0 z-10 border-b-2 border-cyan-500">
@@ -798,7 +799,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- MODAL: Libro Mayor de Compras -->
         <div id="modal-historial-compras" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -814,7 +814,6 @@ HTML_TEMPLATE = """
                         </button>
                     </div>
                 </div>
-                
                 <div class="overflow-y-auto flex-1 bg-slate-50 dark:bg-slate-900 p-4">
                     <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
                         <thead class="bg-slate-900 sticky top-0 z-10 border-b-2 border-cyan-500">
@@ -834,19 +833,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- BOTÓN FLOTANTE: Alertas -->
         <button id="btn-alertas-flotante" onclick="abrirModalAlertas(event)" class="hidden fixed bottom-8 right-8 z-50 bg-rose-600 hover:bg-rose-500 text-white rounded-full p-4 shadow-2xl transition-transform hover:scale-110 group">
             <span class="absolute top-0 right-0 -mt-1 -mr-1 flex h-4 w-4">
               <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
               <span class="relative inline-flex rounded-full h-4 w-4 bg-rose-500 border-2 border-white"></span>
             </span>
             <i class="fa-solid fa-bell text-2xl"></i>
-            <span class="absolute bottom-full right-0 mb-2 w-max px-3 py-1 bg-slate-900 text-white text-xs font-bold rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
-                Alertas de Stock
-            </span>
         </button>
 
-        <!-- PANEL FLOTANTE: Repuestos a Reabastecer -->
         <div id="modal-alertas-stock" class="hidden fixed bottom-24 right-8 bg-[#0f172a] p-5 rounded-xl shadow-2xl w-96 border border-slate-700 z-50 modal-content" onclick="event.stopPropagation()">
             <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
                 <h2 class="text-base font-bold text-white flex items-center">
@@ -860,56 +854,31 @@ HTML_TEMPLATE = """
                 <ul id="lista-alertas-stock" class="space-y-2"></ul>
             </div>
         </div>
-
     </main>
 
     <script>
-        // --- LOGICA DE TEMA (DARK/LIGHT) ---
         function toggleTheme() {
             const html = document.documentElement;
             const isDark = html.classList.contains('dark');
             const icon = document.getElementById('theme-icon');
-            
-            if (isDark) {
-                html.classList.remove('dark');
-                localStorage.setItem('theme', 'light');
-                icon.className = 'fa-solid fa-moon';
-                actualizarGraficosTema(false);
-            } else {
-                html.classList.add('dark');
-                localStorage.setItem('theme', 'dark');
-                icon.className = 'fa-solid fa-sun text-amber-400';
-                actualizarGraficosTema(true);
-            }
+            if (isDark) { html.classList.remove('dark'); localStorage.setItem('theme', 'light'); icon.className = 'fa-solid fa-moon'; actualizarGraficosTema(false); } 
+            else { html.classList.add('dark'); localStorage.setItem('theme', 'dark'); icon.className = 'fa-solid fa-sun text-amber-400'; actualizarGraficosTema(true); }
         }
 
         function applySavedTheme() {
             const html = document.documentElement;
             const icon = document.getElementById('theme-icon');
-            if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-                html.classList.add('dark');
-                if(icon) icon.className = 'fa-solid fa-sun text-amber-400';
-            } else {
-                html.classList.remove('dark');
-                if(icon) icon.className = 'fa-solid fa-moon';
-            }
+            if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) { html.classList.add('dark'); if(icon) icon.className = 'fa-solid fa-sun text-amber-400'; } 
+            else { html.classList.remove('dark'); if(icon) icon.className = 'fa-solid fa-moon'; }
         }
         applySavedTheme();
 
-        // --- SISTEMA DE NOTIFICACIONES ---
         function mostrarNotificacion(mensaje, tipo='info') {
             const toast = document.getElementById('toast-notificacion');
             const icon = document.getElementById('toast-icon');
             document.getElementById('toast-msg').innerText = mensaje;
-            
-            if(tipo === 'error') {
-                toast.className = "fixed top-5 right-5 bg-rose-600 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] font-bold flex items-center transition-transform duration-300";
-                icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
-            } else {
-                toast.className = "fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] border-l-4 border-cyan-500 font-bold flex items-center transition-transform duration-300";
-                icon.className = "fa-solid fa-circle-check mr-3 text-cyan-400 text-lg";
-            }
-
+            if(tipo === 'error') { toast.className = "fixed top-5 right-5 bg-rose-600 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] font-bold flex items-center transition-transform duration-300"; icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg"; } 
+            else { toast.className = "fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] border-l-4 border-cyan-500 font-bold flex items-center transition-transform duration-300"; icon.className = "fa-solid fa-circle-check mr-3 text-cyan-400 text-lg"; }
             toast.style.transform = "translateX(0)";
             setTimeout(() => { toast.style.transform = "translateX(150%)"; }, 3500);
         }
@@ -925,255 +894,71 @@ HTML_TEMPLATE = """
         let chartMaquinas = null;
         let chartOrdenes = null;
 
-        // Autorización en Interfaz (Ocultar botones si es Técnico)
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
             document.getElementById('btn-historial-compras')?.classList.add('hidden');
             document.getElementById('btn-add-orden')?.classList.add('hidden');
         }
 
-        // Cargar Máquinas
-        fetch('/api/maquinas')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('kpi-equipos').innerText = data.length;
-                let html = '';
-                let maquinasDetenidas = 0;
-                let maquinasOperativas = 0;
-                
-                data.forEach(maquina => {
-                    if (maquina.estado !== 'Operativa') maquinasDetenidas++;
-                    else maquinasOperativas++;
-
-                    let btnImprimirQR = CURRENT_ROLE === 'Admin' ? `<a href="/api/maquinas/etiqueta/${maquina.id_maquina}" target="_blank" class="text-cyan-500 hover:text-cyan-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Imprimir QR"><i class="fa-solid fa-qrcode"></i></a>` : '';
-                    let btnEliminar = CURRENT_ROLE === 'Admin' ? `<button onclick="eliminarMaquina(${maquina.id_maquina})" class="text-slate-300 dark:text-slate-600 hover:text-rose-600 dark:hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar equipo"><i class="fa-solid fa-trash-can"></i></button>` : '';
-
-                    html += `
-                        <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group">
-                            <td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${maquina.codigo_equipo}</td>
-                            <td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400">
-                                <div class="font-bold text-slate-800 dark:text-slate-200 uppercase">${maquina.nombre}</div>
-                                <span class="text-[10px] text-slate-400 dark:text-slate-500 font-medium">Área: ${maquina.area_planta}</span>
-                            </td>
-                            <td class="px-5 py-3 whitespace-nowrap">
-                                <div class="flex items-center justify-between">
-                                    ${getBadge(maquina.estado)}
-                                    <div class="flex items-center">
-                                        ${btnImprimirQR}
-                                        ${btnEliminar}
-                                    </div>
-                                </div>
-                            </td>
-                        </tr>
-                    `;
-                });
-                document.getElementById('tabla-maquinas').innerHTML = html;
-
-                const border = document.getElementById('kpi-planta-border');
-                const iconBg = document.getElementById('kpi-planta-icon-bg');
-                const icon = document.getElementById('kpi-planta-icon');
-                const text = document.getElementById('kpi-planta-text');
-
-                if (data.length === 0) {
-                    text.innerText = "Sin Datos";
-                } else if (maquinasDetenidas === 0) {
-                    text.innerText = "Operativa";
-                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300";
-                    iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white";
-                    icon.className = "fa-solid fa-check-double text-sm";
-                } else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) {
-                    text.innerText = "Op. Parcial";
-                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300";
-                    iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white";
-                    icon.className = "fa-solid fa-triangle-exclamation text-sm";
-                } else {
-                    text.innerText = "Parada General";
-                    border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300";
-                    iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white";
-                    icon.className = "fa-solid fa-circle-xmark text-sm";
-                }
-
-                const isDark = document.documentElement.classList.contains('dark');
-                const darkColor = isDark ? '#334155' : '#1e293b';
-                
-                const ctxMaquinas = document.getElementById('graficoMaquinas').getContext('2d');
-                chartMaquinas = new Chart(ctxMaquinas, {
-                    type: 'doughnut',
-                    data: {
-                        labels: ['Operativas', 'En Mantenimiento'],
-                        datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }]
-                    },
-                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' }
-                });
+        fetch('/api/maquinas').then(response => response.json()).then(data => {
+            document.getElementById('kpi-equipos').innerText = data.length;
+            let html = '';
+            let maquinasDetenidas = 0;
+            let maquinasOperativas = 0;
+            data.forEach(maquina => {
+                if (maquina.estado !== 'Operativa') maquinasDetenidas++;
+                else maquinasOperativas++;
+                let btnImprimirQR = CURRENT_ROLE === 'Admin' ? `<a href="/api/maquinas/etiqueta/${maquina.id_maquina}" target="_blank" class="text-cyan-500 hover:text-cyan-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Imprimir QR"><i class="fa-solid fa-qrcode"></i></a>` : '';
+                let btnEliminar = CURRENT_ROLE === 'Admin' ? `<button onclick="eliminarMaquina(${maquina.id_maquina})" class="text-slate-300 dark:text-slate-600 hover:text-rose-600 dark:hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar equipo"><i class="fa-solid fa-trash-can"></i></button>` : '';
+                html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${maquina.codigo_equipo}</td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400"><div class="font-bold text-slate-800 dark:text-slate-200 uppercase">${maquina.nombre}</div><span class="text-[10px] text-slate-400 dark:text-slate-500 font-medium">Área: ${maquina.area_planta}</span></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(maquina.estado)}<div class="flex items-center">${btnImprimirQR}${btnEliminar}</div></div></td></tr>`;
             });
+            document.getElementById('tabla-maquinas').innerHTML = html;
+            const border = document.getElementById('kpi-planta-border'); const iconBg = document.getElementById('kpi-planta-icon-bg'); const icon = document.getElementById('kpi-planta-icon'); const text = document.getElementById('kpi-planta-text');
+            if (data.length === 0) { text.innerText = "Sin Datos"; } 
+            else if (maquinasDetenidas === 0) { text.innerText = "Operativa"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white"; icon.className = "fa-solid fa-check-double text-sm"; } 
+            else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) { text.innerText = "Op. Parcial"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white"; icon.className = "fa-solid fa-triangle-exclamation text-sm"; } 
+            else { text.innerText = "Parada General"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white"; icon.className = "fa-solid fa-circle-xmark text-sm"; }
+            const isDark = document.documentElement.classList.contains('dark'); const darkColor = isDark ? '#334155' : '#1e293b';
+            chartMaquinas = new Chart(document.getElementById('graficoMaquinas').getContext('2d'), { type: 'doughnut', data: { labels: ['Operativas', 'En Mantenimiento'], datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' } });
+        });
 
-        // Cargar Órdenes
-        fetch('/api/ordenes')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('kpi-ordenes').innerText = data.length;
-                let html = '';
-                let prev = 0, corr = 0, pred = 0;
-
-                if(data.length === 0) {
-                    html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>';
-                } else {
-                    data.forEach(orden => {
-                        if(orden.tipo_mantenimiento === 'Preventivo') prev++;
-                        if(orden.tipo_mantenimiento === 'Correctivo') corr++;
-                        if(orden.tipo_mantenimiento === 'Predictivo') pred++;
-
-                        let btnsAdmin = '';
-                        if (CURRENT_ROLE === 'Admin') {
-                            btnsAdmin = `
-                                <button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button>
-                                <button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>
-                            `;
-                        }
-
-                        html += `
-                            <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group">
-                                <td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${orden.codigo_equipo}</td>
-                                <td class="px-5 py-3 text-[11px] text-slate-600 dark:text-slate-400">
-                                    <div class="font-bold text-slate-800 dark:text-slate-200">${orden.tipo_mantenimiento}</div>
-                                    <div class="truncate w-40 text-slate-500 dark:text-slate-400" title="${orden.descripcion_tarea}">${orden.descripcion_tarea}</div>
-                                    <div class="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mt-0.5"><i class="fa-regular fa-calendar mr-1"></i> ${orden.fecha_programada}</div>
-                                </td>
-                                <td class="px-5 py-3 whitespace-nowrap">
-                                    <div class="flex items-center justify-between">
-                                        ${getBadge(orden.estado_orden)}
-                                        <div class="flex items-center">
-                                            ${btnsAdmin}
-                                            <button onclick="abrirModalCompletar(${orden.id_mantenimiento})" class="text-slate-400 dark:text-slate-500 hover:text-cyan-500 dark:hover:text-cyan-400 transition-colors ml-3 opacity-0 group-hover:opacity-100" title="Marcar finalizada y generar reporte">
-                                                <i class="fa-solid fa-file-signature text-xl"></i>
-                                            </button>
-                                        </div>
-                                    </div>
-                                </td>
-                            </tr>
-                        `;
-                    });
-                }
-                document.getElementById('tabla-ordenes').innerHTML = html;
-
-                const isDark = document.documentElement.classList.contains('dark');
-                const darkGrid = isDark ? '#334155' : '#e2e8f0';
-                const darkText = isDark ? '#94a3b8' : '#64748b';
-
-                const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
-                chartOrdenes = new Chart(ctxOrdenes, {
-                    type: 'bar',
-                    data: {
-                        labels: ['Preventivo', 'Correctivo', 'Predictivo'],
-                        datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }]
-                    },
-                    options: { 
-                        responsive: true, maintainAspectRatio: false, 
-                        plugins: { legend: { display: false } }, 
-                        scales: { 
-                            y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, 
-                            x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } 
-                        } 
-                    }
+        fetch('/api/ordenes').then(response => response.json()).then(data => {
+            document.getElementById('kpi-ordenes').innerText = data.length;
+            let html = ''; let prev = 0, corr = 0, pred = 0;
+            if(data.length === 0) { html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>'; } 
+            else {
+                data.forEach(orden => {
+                    if(orden.tipo_mantenimiento === 'Preventivo') prev++; if(orden.tipo_mantenimiento === 'Correctivo') corr++; if(orden.tipo_mantenimiento === 'Predictivo') pred++;
+                    let btnsAdmin = '';
+                    if (CURRENT_ROLE === 'Admin') { btnsAdmin = `<button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button><button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>`; }
+                    let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
+                    html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${orden.codigo_equipo}</td><td class="px-5 py-3 text-[11px] text-slate-600 dark:text-slate-400">${codRemanDisplay}<div class="font-bold text-slate-800 dark:text-slate-200">${orden.tipo_mantenimiento}</div><div class="truncate w-40 text-slate-500 dark:text-slate-400" title="${orden.descripcion_tarea}">${orden.descripcion_tarea}</div><div class="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mt-0.5"><i class="fa-regular fa-calendar mr-1"></i> ${orden.fecha_programada}</div></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(orden.estado_orden)}<div class="flex items-center">${btnsAdmin}<button onclick="abrirModalCompletar(${orden.id_mantenimiento})" class="text-slate-400 dark:text-slate-500 hover:text-cyan-500 dark:hover:text-cyan-400 transition-colors ml-3 opacity-0 group-hover:opacity-100" title="Marcar finalizada y generar reporte"><i class="fa-solid fa-file-signature text-xl"></i></button></div></div></td></tr>`;
                 });
+            }
+            document.getElementById('tabla-ordenes').innerHTML = html;
+            const isDark = document.documentElement.classList.contains('dark'); const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
+            chartOrdenes = new Chart(document.getElementById('graficoOrdenes').getContext('2d'), { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
+        });
+
+        fetch('/api/inventario').then(response => response.json()).then(data => {
+            let html = ''; let htmlAlertas = ''; let itemsCriticos = 0;
+            data.forEach(item => {
+                let estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50 uppercase tracking-wide">Óptimo</span>';
+                let textClass = "text-slate-800 dark:text-slate-200";
+                if (item.cantidad_actual <= item.punto_reorden) { estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>'; textClass = "text-rose-600 dark:text-rose-400 font-bold"; itemsCriticos++; htmlAlertas += `<li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm"><div><span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span><span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span></div><div class="text-right flex flex-col items-end"><div class="flex items-baseline space-x-1"><span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span></div><div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div></div></li>`; }
+                let botonesAccionHtml = '';
+                if(CURRENT_ROLE === 'Admin') { botonesAccionHtml = `<div class="flex items-center space-x-1"><button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button><button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button><div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div><button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button></div>`; }
+                html += `<tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-5 py-3 whitespace-nowrap"><div class="text-[11px] font-bold text-slate-800 dark:text-slate-200">${item.codigo_pieza}</div><div class="text-[11px] text-slate-500 dark:text-slate-400">${item.nombre}</div></td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400 font-medium"><i class="fa-solid fa-location-dot mr-1 text-slate-400 dark:text-slate-500"></i> ${item.ubicacion_almacen}</td><td class="px-5 py-3 whitespace-nowrap text-[11px]"><div class="flex items-center space-x-3"><div class="w-16"><span class="${textClass} text-lg">${item.cantidad_actual}</span> <span class="text-slate-400 dark:text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span><div class="text-[9px] text-slate-400 dark:text-slate-500 font-medium uppercase mt-0.5">Mínimo: ${item.punto_reorden}</div></div>${botonesAccionHtml}</div></td><td class="px-5 py-3 whitespace-nowrap">${estadoStock}</td></tr>`;
             });
-
-        // Cargar Inventario
-        fetch('/api/inventario')
-            .then(response => response.json())
-            .then(data => {
-                let html = '';
-                let htmlAlertas = '';
-                let itemsCriticos = 0;
-
-                data.forEach(item => {
-                    let estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50 uppercase tracking-wide">Óptimo</span>';
-                    let textClass = "text-slate-800 dark:text-slate-200";
-                    
-                    if (item.cantidad_actual <= item.punto_reorden) {
-                        estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>';
-                        textClass = "text-rose-600 dark:text-rose-400 font-bold";
-                        itemsCriticos++;
-                        
-                        htmlAlertas += `
-                            <li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm">
-                                <div>
-                                    <span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span>
-                                    <span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span>
-                                </div>
-                                <div class="text-right flex flex-col items-end">
-                                    <div class="flex items-baseline space-x-1">
-                                        <span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> 
-                                        <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span>
-                                    </div>
-                                    <div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div>
-                                </div>
-                            </li>
-                        `;
-                    }
-
-                    let botonesAccionHtml = '';
-                    if(CURRENT_ROLE === 'Admin') {
-                        botonesAccionHtml = `
-                            <div class="flex items-center space-x-1">
-                                <button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button>
-                                <button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button>
-                                <div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div>
-                                <button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button>
-                            </div>
-                        `;
-                    }
-
-                    html += `
-                        <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                            <td class="px-5 py-3 whitespace-nowrap">
-                                <div class="text-[11px] font-bold text-slate-800 dark:text-slate-200">${item.codigo_pieza}</div>
-                                <div class="text-[11px] text-slate-500 dark:text-slate-400">${item.nombre}</div>
-                            </td>
-                            <td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400 font-medium">
-                                <i class="fa-solid fa-location-dot mr-1 text-slate-400 dark:text-slate-500"></i> ${item.ubicacion_almacen}
-                            </td>
-                            <td class="px-5 py-3 whitespace-nowrap text-[11px]">
-                                <div class="flex items-center space-x-3">
-                                    <div class="w-16">
-                                        <span class="${textClass} text-lg">${item.cantidad_actual}</span> <span class="text-slate-400 dark:text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span>
-                                        <div class="text-[9px] text-slate-400 dark:text-slate-500 font-medium uppercase mt-0.5">Mínimo: ${item.punto_reorden}</div>
-                                    </div>
-                                    ${botonesAccionHtml}
-                                </div>
-                            </td>
-                            <td class="px-5 py-3 whitespace-nowrap">${estadoStock}</td>
-                        </tr>
-                    `;
-                });
-                document.getElementById('tabla-inventario').innerHTML = html;
-                
-                const btnFlotante = document.getElementById('btn-alertas-flotante');
-                const listaAlertas = document.getElementById('lista-alertas-stock');
-                
-                if (itemsCriticos > 0) {
-                    btnFlotante.classList.remove('hidden');
-                    listaAlertas.innerHTML = htmlAlertas;
-                } else {
-                    btnFlotante.classList.add('hidden');
-                }
-            });
+            document.getElementById('tabla-inventario').innerHTML = html;
+            const btnFlotante = document.getElementById('btn-alertas-flotante'); const listaAlertas = document.getElementById('lista-alertas-stock');
+            if (itemsCriticos > 0) { btnFlotante.classList.remove('hidden'); listaAlertas.innerHTML = htmlAlertas; } else { btnFlotante.classList.add('hidden'); }
+        });
 
         function actualizarGraficosTema(isDark) {
-            const darkColor = isDark ? '#334155' : '#1e293b';
-            const darkGrid = isDark ? '#334155' : '#e2e8f0';
-            const darkText = isDark ? '#94a3b8' : '#64748b';
-
-            if(chartMaquinas) {
-                chartMaquinas.data.datasets[0].backgroundColor[1] = darkColor;
-                chartMaquinas.update();
-            }
-            if(chartOrdenes) {
-                chartOrdenes.options.scales.x.ticks.color = darkText;
-                chartOrdenes.options.scales.y.ticks.color = darkText;
-                chartOrdenes.options.scales.y.grid.color = darkGrid;
-                chartOrdenes.update();
-            }
+            const darkColor = isDark ? '#334155' : '#1e293b'; const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
+            if(chartMaquinas) { chartMaquinas.data.datasets[0].backgroundColor[1] = darkColor; chartMaquinas.update(); }
+            if(chartOrdenes) { chartOrdenes.options.scales.x.ticks.color = darkText; chartOrdenes.options.scales.y.ticks.color = darkText; chartOrdenes.options.scales.y.grid.color = darkGrid; chartOrdenes.update(); }
         }
 
         function descontarStock(id) { fetch(`/api/inventario/descontar/${id}`, {method:'POST'}).then(r=>r.json()).then(d=>{if(d.status==='ok')window.location.reload();}); }
@@ -1181,302 +966,91 @@ HTML_TEMPLATE = """
         function filtrarInventario() { const txt = document.getElementById('buscador-inventario').value.toLowerCase(); document.querySelectorAll('#tabla-inventario tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
         function filtrarMaquinas() { const txt = document.getElementById('buscador-maquinas').value.toLowerCase(); document.querySelectorAll('#tabla-maquinas tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
 
-        // MODAL COMPRAS
-        function abrirModalCompra(id_repuesto, codigo, nombre) {
-            document.getElementById('compra-id-repuesto').value = id_repuesto;
-            document.getElementById('compra-subtitulo').innerText = `${codigo} - ${nombre}`;
-            document.getElementById('form-registro-compra').reset();
-            document.getElementById('modal-compra').classList.remove('hidden');
-        }
+        function abrirModalCompra(id_repuesto, codigo, nombre) { document.getElementById('compra-id-repuesto').value = id_repuesto; document.getElementById('compra-subtitulo').innerText = `${codigo} - ${nombre}`; document.getElementById('form-registro-compra').reset(); document.getElementById('modal-compra').classList.remove('hidden'); }
         function cerrarModalCompra() { document.getElementById('modal-compra').classList.add('hidden'); }
-        function guardarCompra(e) {
-            e.preventDefault();
-            const id = document.getElementById('compra-id-repuesto').value;
-            fetch(`/api/inventario/comprar/${id}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    cantidad: document.getElementById('compra-cantidad').value,
-                    costo: document.getElementById('compra-costo').value,
-                    proveedor: document.getElementById('compra-proveedor').value,
-                    factura: document.getElementById('compra-factura').value
-                })
-            }).then(r => r.json()).then(res => { if(res.status === 'ok') window.location.reload(); });
-        }
+        function guardarCompra(e) { e.preventDefault(); const id = document.getElementById('compra-id-repuesto').value; fetch(`/api/inventario/comprar/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cantidad: document.getElementById('compra-cantidad').value, costo: document.getElementById('compra-costo').value, proveedor: document.getElementById('compra-proveedor').value, factura: document.getElementById('compra-factura').value }) }).then(r => r.json()).then(res => { if(res.status === 'ok') window.location.reload(); }); }
         
         function abrirModalCompras() {
             fetch('/api/compras').then(res => res.json()).then(data => {
                 let html = '';
-                if(data.length === 0) {
-                    html = '<tr><td colspan="7" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">No hay registros de compras.</td></tr>';
-                } else {
-                    data.forEach(c => {
-                        html += `
-                            <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar text-emerald-500 mr-1"></i> ${c.fecha_compra}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs"><span class="font-bold text-slate-800 dark:text-slate-200">${c.codigo_pieza}</span><br><span class="text-[10px] text-slate-500 dark:text-slate-400">${c.nombre}</span></td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-700 dark:text-slate-300 text-center">${c.cantidad}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 text-right">$${c.costo_unitario.toFixed(2)}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-emerald-600 dark:text-emerald-400 text-right">$${c.costo_total.toFixed(2)}</td>
-                                <td class="px-4 py-3 text-xs text-slate-600 dark:text-slate-400 pl-6">${c.proveedor}</td>
-                                <td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${c.factura}</span></td>
-                            </tr>
-                        `;
-                    });
-                }
-                document.getElementById('tabla-historial-compras').innerHTML = html;
-                document.getElementById('modal-historial-compras').classList.remove('hidden');
+                if(data.length === 0) { html = '<tr><td colspan="7" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">No hay registros de compras.</td></tr>'; } 
+                else { data.forEach(c => { html += `<tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar text-emerald-500 mr-1"></i> ${c.fecha_compra}</td><td class="px-4 py-3 whitespace-nowrap text-xs"><span class="font-bold text-slate-800 dark:text-slate-200">${c.codigo_pieza}</span><br><span class="text-[10px] text-slate-500 dark:text-slate-400">${c.nombre}</span></td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-700 dark:text-slate-300 text-center">${c.cantidad}</td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 text-right">$${c.costo_unitario.toFixed(2)}</td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-emerald-600 dark:text-emerald-400 text-right">$${c.costo_total.toFixed(2)}</td><td class="px-4 py-3 text-xs text-slate-600 dark:text-slate-400 pl-6">${c.proveedor}</td><td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${c.factura}</span></td></tr>`; }); }
+                document.getElementById('tabla-historial-compras').innerHTML = html; document.getElementById('modal-historial-compras').classList.remove('hidden');
             });
         }
         function cerrarModalCompras() { document.getElementById('modal-historial-compras').classList.add('hidden'); }
 
-        // MODAL ÓRDENES
         function abrirModalOrden() { 
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-400 mr-2"></i> Programar Orden';
             document.getElementById('form-nueva-orden').reset();
             document.getElementById('orden-id').value = '';
+            document.getElementById('contenedor-reman').classList.remove('hidden');
             document.getElementById('modal-orden').classList.remove('hidden'); 
-            
-            fetch('/api/maquinas').then(r => r.json()).then(data => {
-                let s = document.getElementById('select-maquina'); 
-                s.innerHTML = '<option value="" disabled selected>Seleccione...</option>'; 
-                data.forEach(m => {
-                    s.innerHTML += `<option value="${m.id_maquina}" title="${m.codigo_equipo} - ${m.nombre}">${m.codigo_equipo} - ${m.nombre}</option>`;
-                });
-            });
+            fetch('/api/maquinas').then(r => r.json()).then(data => { let s = document.getElementById('select-maquina'); s.innerHTML = '<option value="" disabled selected>Seleccione...</option>'; data.forEach(m => { s.innerHTML += `<option value="${m.id_maquina}" title="${m.codigo_equipo} - ${m.nombre}">${m.codigo_equipo} - ${m.nombre}</option>`; }); });
         }
 
         function editarOrden(id_orden, id_maquina, tipo, desc, fecha, tecnico) {
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-pen-to-square text-amber-500 mr-2"></i> Editar Orden';
-            document.getElementById('orden-id').value = id_orden;
-            document.getElementById('select-tipo').value = tipo;
-            document.getElementById('input-descripcion').value = desc;
-            document.getElementById('input-fecha').value = fecha;
-            document.getElementById('input-tecnico').value = tecnico;
-            
-            fetch('/api/maquinas').then(r => r.json()).then(data => {
-                let s = document.getElementById('select-maquina'); 
-                s.innerHTML = ''; 
-                data.forEach(m => {
-                    let sel = m.id_maquina === id_maquina ? 'selected' : '';
-                    s.innerHTML += `<option value="${m.id_maquina}" ${sel}>${m.codigo_equipo} - ${m.nombre}</option>`;
-                });
-            });
+            document.getElementById('orden-id').value = id_orden; document.getElementById('select-tipo').value = tipo; document.getElementById('input-descripcion').value = desc; document.getElementById('input-fecha').value = fecha; document.getElementById('input-tecnico').value = tecnico; document.getElementById('contenedor-reman').classList.add('hidden');
+            fetch('/api/maquinas').then(r => r.json()).then(data => { let s = document.getElementById('select-maquina'); s.innerHTML = ''; data.forEach(m => { let sel = m.id_maquina === id_maquina ? 'selected' : ''; s.innerHTML += `<option value="${m.id_maquina}" ${sel}>${m.codigo_equipo} - ${m.nombre}</option>`; }); });
             document.getElementById('modal-orden').classList.remove('hidden');
         }
 
-        function eliminarOrden(id) {
-            fetch(`/api/ordenes/eliminar/${id}`, {method:'DELETE'}).then(r=>r.json()).then(res=>{
-                if(res.status==='ok') window.location.reload(); 
-            });
-        }
-
-        function cerrarModalOrden() { 
-            document.getElementById('modal-orden').classList.add('hidden'); 
-        }
+        function eliminarOrden(id) { fetch(`/api/ordenes/eliminar/${id}`, {method:'DELETE'}).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); }); }
+        function cerrarModalOrden() { document.getElementById('modal-orden').classList.add('hidden'); }
 
         function guardarOrden(e) { 
             e.preventDefault(); 
             const id_orden = document.getElementById('orden-id').value;
-            const payload = {
-                id_maquina: document.getElementById('select-maquina').value, 
-                tipo_mantenimiento: document.getElementById('select-tipo').value, 
-                descripcion: document.getElementById('input-descripcion').value, 
-                fecha: document.getElementById('input-fecha').value, 
-                tecnico: document.getElementById('input-tecnico').value
-            };
-
+            const payload = { id_maquina: document.getElementById('select-maquina').value, tipo_mantenimiento: document.getElementById('select-tipo').value, descripcion: document.getElementById('input-descripcion').value, fecha: document.getElementById('input-fecha').value, tecnico: document.getElementById('input-tecnico').value, codigo_reman_manual: document.getElementById('input-reman-manual') ? document.getElementById('input-reman-manual').value : '' };
             const endpoint = id_orden ? `/api/ordenes/editar/${id_orden}` : '/api/ordenes/nueva';
-            
-            fetch(endpoint, {
-                method: 'POST',
-                headers: {'Content-Type':'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r=>r.json()).then(res=>{
-                if(res.status==='ok') window.location.reload();
-            }); 
+            fetch(endpoint, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); }); 
         }
 
         function abrirModalMaquina() { document.getElementById('modal-maquina').classList.remove('hidden'); }
         function cerrarModalMaquina() { document.getElementById('modal-maquina').classList.add('hidden'); document.getElementById('form-nueva-maquina').reset(); }
         function guardarMaquina(e) { e.preventDefault(); fetch('/api/maquinas/nueva',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({codigo:document.getElementById('input-maq-codigo').value, nombre:document.getElementById('input-maq-nombre').value, area:document.getElementById('select-maq-area').value, criticidad:document.getElementById('select-maq-criticidad').value})}).then(r=>r.json()).then(res=>{if(res.status==='ok') window.location.reload();}); }
-        
-        function eliminarMaquina(id) { 
-            fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{
-                if(res.status==='ok') window.location.reload(); 
-                else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error');
-            }); 
-        }
+        function eliminarMaquina(id) { fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error'); }); }
 
-        // LÓGICA AVANZADA: COMPLETAR ORDEN Y REPORTE
-        let repuestosUsadosTemp = [];
-        let evidenciasBase64 = [];
-        const modalCompletar = document.getElementById('modal-completar');
-
+        let repuestosUsadosTemp = []; let evidenciasBase64 = []; const modalCompletar = document.getElementById('modal-completar');
         function abrirModalCompletar(id_orden) {
-            document.getElementById('completar-id-orden').value = id_orden;
-            
-            document.getElementById('input-obs').value = '';
-            document.getElementById('input-rec').value = '';
-            document.getElementById('input-trabajos').value = '';
-            document.getElementById('input-equipos').value = '';
-            document.getElementById('input-tiempo').value = '';
-            
-            // Limpiar área fotográfica
-            document.getElementById('input-fotos').value = '';
-            document.getElementById('preview-fotos').innerHTML = '';
-            
-            repuestosUsadosTemp = [];
-            evidenciasBase64 = [];
-            actualizarListaUI();
-            
-            fetch('/api/inventario').then(res => res.json()).then(data => {
-                const select = document.getElementById('select-uso-repuesto');
-                select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
-                data.forEach(r => {
-                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} - ${r.nombre} (Stock: ${r.cantidad_actual})</option>`;
-                });
-            });
+            document.getElementById('completar-id-orden').value = id_orden; document.getElementById('input-obs').value = ''; document.getElementById('input-rec').value = ''; document.getElementById('input-trabajos').value = ''; document.getElementById('input-equipos').value = ''; document.getElementById('input-tiempo').value = ''; document.getElementById('input-fotos').value = ''; document.getElementById('preview-fotos').innerHTML = '';
+            repuestosUsadosTemp = []; evidenciasBase64 = []; actualizarListaUI();
+            fetch('/api/inventario').then(res => res.json()).then(data => { const select = document.getElementById('select-uso-repuesto'); select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>'; data.forEach(r => { if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} - ${r.nombre} (Stock: ${r.cantidad_actual})</option>`; }); });
             modalCompletar.classList.remove('hidden');
         }
-
         function cerrarModalCompletar() { modalCompletar.classList.add('hidden'); }
-
-        function agregarRepuestoALista() {
-            const select = document.getElementById('select-uso-repuesto');
-            const cant = document.getElementById('input-uso-cant').value;
-            if(!select.value || cant <= 0) { 
-                mostrarNotificacion("Selecciona un repuesto y cantidad válida.", 'error'); 
-                return; 
-            }
-            repuestosUsadosTemp.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
-            actualizarListaUI();
-        }
-
-        function actualizarListaUI() {
-            const ul = document.getElementById('lista-repuestos-usados');
-            if(repuestosUsadosTemp.length === 0) { ul.innerHTML = '<li class="py-2 text-sm text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; }
-            ul.innerHTML = '';
-            repuestosUsadosTemp.forEach((item, index) => {
-                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-sm text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuesto(${index})" class="text-rose-500 hover:text-rose-400"><i class="fa-solid fa-xmark"></i></button></li>`;
-            });
-        }
-        
+        function agregarRepuestoALista() { const select = document.getElementById('select-uso-repuesto'); const cant = document.getElementById('input-uso-cant').value; if(!select.value || cant <= 0) { mostrarNotificacion("Selecciona un repuesto y cantidad válida.", 'error'); return; } repuestosUsadosTemp.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant }); actualizarListaUI(); }
+        function actualizarListaUI() { const ul = document.getElementById('lista-repuestos-usados'); if(repuestosUsadosTemp.length === 0) { ul.innerHTML = '<li class="py-2 text-sm text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; } ul.innerHTML = ''; repuestosUsadosTemp.forEach((item, index) => { ul.innerHTML += `<li class="py-2 flex justify-between items-center text-sm text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuesto(${index})" class="text-rose-500 hover:text-rose-400"><i class="fa-solid fa-xmark"></i></button></li>`; }); }
         function quitarRepuesto(i) { repuestosUsadosTemp.splice(i, 1); actualizarListaUI(); }
 
         function procesarImagenes(event) {
-            const files = event.target.files;
-            const previewContainer = document.getElementById('preview-fotos');
-            previewContainer.innerHTML = '';
-            evidenciasBase64 = [];
-
-            Array.from(files).forEach(file => {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const b64 = e.target.result;
-                    const base64Data = b64.split(',')[1];
-                    evidenciasBase64.push(base64Data);
-
-                    const img = document.createElement('img');
-                    img.src = b64;
-                    img.className = 'w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm';
-                    previewContainer.appendChild(img);
-                };
-                reader.readAsDataURL(file);
-            });
+            const files = event.target.files; const previewContainer = document.getElementById('preview-fotos'); previewContainer.innerHTML = ''; evidenciasBase64 = [];
+            Array.from(files).forEach(file => { const reader = new FileReader(); reader.onload = (e) => { const b64 = e.target.result; const base64Data = b64.split(',')[1]; evidenciasBase64.push(base64Data); const img = document.createElement('img'); img.src = b64; img.className = 'w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm'; previewContainer.appendChild(img); }; reader.readAsDataURL(file); });
         }
 
         function confirmarCompletarOrden() {
-            const id_orden = document.getElementById('completar-id-orden').value;
-            const obs = document.getElementById('input-obs').value || 'Sin observaciones adicionales.';
-            const rec = document.getElementById('input-rec').value || 'Ninguna recomendación específica.';
-            const trabajos = document.getElementById('input-trabajos').value || 'Trabajos de rutina.';
-            const equipos = document.getElementById('input-equipos').value || 'Herramientas manuales.';
-            const tiempo = document.getElementById('input-tiempo').value || 'No especificado.';
-            
-            fetch(`/api/ordenes/completar/${id_orden}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    repuestos: repuestosUsadosTemp, 
-                    observaciones: obs, 
-                    recomendaciones: rec, 
-                    trabajos_realizados: trabajos, 
-                    equipos_necesarios: equipos, 
-                    tiempo_ejecucion: tiempo,
-                    evidencias: evidenciasBase64
-                })
-            }).then(res => res.json()).then(r => { if(r.status === 'ok') window.location.reload(); });
+            const id_orden = document.getElementById('completar-id-orden').value; const obs = document.getElementById('input-obs').value || 'Sin observaciones adicionales.'; const rec = document.getElementById('input-rec').value || 'Ninguna recomendación específica.'; const trabajos = document.getElementById('input-trabajos').value || 'Trabajos de rutina.'; const equipos = document.getElementById('input-equipos').value || 'Herramientas manuales.'; const tiempo = document.getElementById('input-tiempo').value || 'No especificado.';
+            fetch(`/api/ordenes/completar/${id_orden}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repuestos: repuestosUsadosTemp, observaciones: obs, recomendaciones: rec, trabajos_realizados: trabajos, equipos_necesarios: equipos, tiempo_ejecucion: tiempo, evidencias: evidenciasBase64 }) }).then(res => res.json()).then(r => { if(r.status === 'ok') window.location.reload(); });
         }
 
-        // HISTORIAL DE AUDITORÍA (PDF)
         function abrirModalHistorial() {
             fetch('/api/historial').then(res => res.json()).then(data => {
                 let html = '';
-                if(data.length === 0) {
-                    html = '<tr><td colspan="6" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">El historial está vacío.</td></tr>';
-                } else {
-                    data.forEach(h => {
-                        html += `
-                            <tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors">
-                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar-check text-emerald-500 mr-1"></i> ${h.fecha_ejecucion}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-800 dark:text-slate-200">${h.codigo_equipo}</td>
-                                <td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${h.tipo_mantenimiento}</span></td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400">${h.tiempo_ejecucion}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-700 dark:text-slate-300 font-medium"><i class="fa-solid fa-user-tag text-cyan-500 mr-1"></i> ${h.tecnico_asignado}</td>
-                                <td class="px-4 py-3 text-center whitespace-nowrap flex justify-center">
-                                    <button onclick="descargarReportePDF(${h.id_mantenimiento})" class="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center">
-                                        <i class="fa-solid fa-file-pdf mr-1.5"></i> .PDF
-                                    </button>
-                                </td>
-                            </tr>
-                        `;
-                    });
-                }
-                document.getElementById('tabla-historial').innerHTML = html;
-                document.getElementById('modal-historial').classList.remove('hidden');
+                if(data.length === 0) { html = '<tr><td colspan="6" class="px-6 py-8 text-center text-sm text-slate-500 dark:text-slate-400 italic">El historial está vacío.</td></tr>'; } 
+                else { data.forEach(h => { let codRemanHist = h.codigo_reman ? `<div class="text-[9px] text-cyan-400 font-bold mb-0.5">${h.codigo_reman}</div>` : ''; html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-semibold"><i class="fa-regular fa-calendar-check text-emerald-500 mr-1"></i> ${h.fecha_ejecucion}</td><td class="px-4 py-3 whitespace-nowrap text-xs font-bold text-slate-800 dark:text-slate-200">${codRemanHist}${h.codigo_equipo}</td><td class="px-4 py-3 whitespace-nowrap"><span class="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 px-2 py-0.5 rounded text-[10px] font-bold border border-slate-200 dark:border-slate-700">${h.tipo_mantenimiento}</span></td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400">${h.tiempo_ejecucion}</td><td class="px-4 py-3 whitespace-nowrap text-xs text-slate-700 dark:text-slate-300 font-medium"><i class="fa-solid fa-user-tag text-cyan-500 mr-1"></i> ${h.tecnico_asignado}</td><td class="px-4 py-3 text-center whitespace-nowrap flex justify-center"><button onclick="descargarReportePDF(${h.id_mantenimiento})" class="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-all flex items-center"><i class="fa-solid fa-file-pdf mr-1.5"></i> .PDF</button></td></tr>`; }); }
+                document.getElementById('tabla-historial').innerHTML = html; document.getElementById('modal-historial').classList.remove('hidden');
             });
         }
         function cerrarModalHistorial() { document.getElementById('modal-historial').classList.add('hidden'); }
-        
-        function descargarReportePDF(id) { 
-            mostrarNotificacion("Generando Reporte PDF oficial...");
-            window.location.href = `/api/reporte/${id}`; 
-        }
-
-        function abrirModalAlertas(e) { 
-            if(e) e.stopPropagation();
-            document.getElementById('modal-alertas-stock').classList.remove('hidden'); 
-        }
+        function descargarReportePDF(id) { mostrarNotificacion("Generando Reporte PDF oficial..."); window.location.href = `/api/reporte/${id}`; }
+        function abrirModalAlertas(e) { if(e) e.stopPropagation(); document.getElementById('modal-alertas-stock').classList.remove('hidden'); }
         function cerrarModalAlertas() { document.getElementById('modal-alertas-stock').classList.add('hidden'); }
+        function descargarInventarioExcel() { mostrarNotificacion("Descargando libro de Excel..."); window.location.href = "/api/inventario/exportar"; }
+        function descargarComprasExcel() { mostrarNotificacion("Descargando libro contable de Compras..."); window.location.href = "/api/compras/exportar"; }
         
-        function descargarInventarioExcel() { 
-            mostrarNotificacion("Descargando libro de Excel...");
-            window.location.href = "/api/inventario/exportar"; 
-        }
-        function descargarComprasExcel() { 
-            mostrarNotificacion("Descargando libro contable de Compras...");
-            window.location.href = "/api/compras/exportar"; 
-        }
-
-        window.addEventListener('click', function(e) {
-            if (e.target.classList.contains('modal-container')) {
-                e.target.classList.add('hidden');
-            }
-            const panelAlertas = document.getElementById('modal-alertas-stock');
-            const btnAlertas = document.getElementById('btn-alertas-flotante');
-            if (panelAlertas && !panelAlertas.classList.contains('hidden') && !panelAlertas.contains(e.target) && e.target !== btnAlertas && !btnAlertas.contains(e.target)) {
-                cerrarModalAlertas();
-            }
-        });
-
-        window.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape' || e.key === 'Esc') {
-                document.querySelectorAll('.modal-container').forEach(m => m.classList.add('hidden'));
-                const mAlertas = document.getElementById('modal-alertas-stock');
-                if (mAlertas && !mAlertas.classList.contains('hidden')) cerrarModalAlertas();
-            }
-        });
+        window.addEventListener('click', function(e) { if (e.target.classList.contains('modal-container')) { e.target.classList.add('hidden'); } const panelAlertas = document.getElementById('modal-alertas-stock'); const btnAlertas = document.getElementById('btn-alertas-flotante'); if (panelAlertas && !panelAlertas.classList.contains('hidden') && !panelAlertas.contains(e.target) && e.target !== btnAlertas && !btnAlertas.contains(e.target)) { cerrarModalAlertas(); } });
+        window.addEventListener('keydown', function(e) { if (e.key === 'Escape' || e.key === 'Esc') { document.querySelectorAll('.modal-container').forEach(m => m.classList.add('hidden')); const mAlertas = document.getElementById('modal-alertas-stock'); if (mAlertas && !mAlertas.classList.contains('hidden')) cerrarModalAlertas(); } });
     </script>
 </body>
 </html>
@@ -1492,21 +1066,15 @@ MOBILE_MACHINE_TEMPLATE = """
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
-        .toast-enter { transform: translateY(100%); opacity: 0; }
-        .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 0.3s ease-out; }
-    </style>
+    <style> body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; } .toast-enter { transform: translateY(100%); opacity: 0; } .toast-enter-active { transform: translateY(0); opacity: 1; transition: all 0.3s ease-out; } </style>
 </head>
 <body class="pb-20 relative">
 
-    <!-- Toast Notification (Mobile) -->
     <div id="mobile-toast" class="fixed bottom-5 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-3 rounded-xl shadow-2xl border border-slate-700 z-[100] flex items-center w-11/12 max-w-sm toast-enter hidden">
         <i id="mobile-toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="mobile-toast-msg" class="text-sm font-semibold">Mensaje</span>
     </div>
 
-    <!-- Header Fijo -->
     <header class="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-50 shadow-lg flex justify-between items-center">
         <div class="flex flex-col">
             <span class="text-cyan-400 font-bold text-sm tracking-widest uppercase">Perfil de Máquina</span>
@@ -1518,7 +1086,6 @@ MOBILE_MACHINE_TEMPLATE = """
     </header>
 
     <div class="p-4 space-y-6">
-        <!-- 1. Tarjeta Principal de la Máquina -->
         <div class="bg-slate-900 rounded-2xl p-5 border border-slate-800 shadow-xl relative overflow-hidden">
             {% if maquina.estado == 'Operativa' %}
                 <div class="absolute left-0 top-0 bottom-0 w-1.5 bg-emerald-500"></div>
@@ -1545,7 +1112,6 @@ MOBILE_MACHINE_TEMPLATE = """
             </div>
         </div>
 
-        <!-- 2. Sección de Órdenes Pendientes -->
         <div>
             <div class="flex justify-between items-center mb-3 ml-1">
                 <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs flex items-center">
@@ -1566,13 +1132,13 @@ MOBILE_MACHINE_TEMPLATE = """
                         <div class="absolute left-0 top-0 bottom-0 w-1 {% if orden.tipo_mantenimiento == 'Preventivo' %}bg-cyan-500{% elif orden.tipo_mantenimiento == 'Correctivo' %}bg-rose-500{% else %}bg-slate-400{% endif %}"></div>
                         
                         <div class="pl-2">
+                            <div class="text-[10px] font-bold text-cyan-400 mb-1 tracking-wider">{{ orden.codigo_reman if orden.codigo_reman else 'NUEVA ORDEN' }}</div>
                             <div class="flex justify-between items-start mb-2">
                                 <span class="text-xs font-bold {% if orden.tipo_mantenimiento == 'Preventivo' %}text-cyan-400{% elif orden.tipo_mantenimiento == 'Correctivo' %}text-rose-400{% else %}text-slate-300{% endif %} uppercase tracking-wider">{{ orden.tipo_mantenimiento }}</span>
                                 <span class="text-[10px] font-bold text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20"><i class="fa-regular fa-clock mr-1"></i>{{ orden.fecha_programada }}</span>
                             </div>
                             <p class="text-sm font-medium text-slate-200 mb-3">{{ orden.descripcion_tarea }}</p>
                             
-                            <!-- Botón para Completar Orden Directamente -->
                             <button onclick="abrirModalReporteMovel({{ orden.id_mantenimiento }})" class="w-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-white font-bold py-2.5 rounded-lg text-sm transition-colors border border-slate-700 flex justify-center items-center shadow-inner">
                                 <i class="fa-solid fa-file-signature mr-2 text-cyan-400"></i> Generar Reporte
                             </button>
@@ -1583,7 +1149,6 @@ MOBILE_MACHINE_TEMPLATE = """
             {% endif %}
         </div>
 
-        <!-- 3. Historial Rápido de Intervenciones -->
         <div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-3 ml-1 flex items-center">
                 <i class="fa-solid fa-clock-rotate-left mr-2 text-slate-500"></i> Últimas Intervenciones
@@ -1612,26 +1177,19 @@ MOBILE_MACHINE_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MODAL MÓVIL: Formulario de Reporte Completo CON TODOS LOS ITEMS FALTANTES -->
     <div id="modal-reporte-movil" class="fixed inset-0 bg-slate-950/90 z-[60] hidden flex-col justify-end transform transition-transform duration-300 translate-y-full">
         <div class="bg-slate-900 w-full h-[95vh] rounded-t-3xl border-t border-slate-700 flex flex-col shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
-            
-            <div class="w-full flex justify-center py-3" onclick="cerrarModalReporteMovel()">
-                <div class="w-12 h-1.5 bg-slate-700 rounded-full"></div>
-            </div>
+            <div class="w-full flex justify-center py-3" onclick="cerrarModalReporteMovel()"><div class="w-12 h-1.5 bg-slate-700 rounded-full"></div></div>
             
             <div class="px-5 pb-4 border-b border-slate-800 flex justify-between items-center shrink-0">
                 <h3 class="text-lg font-bold text-white flex items-center">
                     <i class="fa-solid fa-flag-checkered text-emerald-500 mr-2"></i> Finalizar Trabajo
                 </h3>
-                <button onclick="cerrarModalReporteMovel()" class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400">
-                    <i class="fa-solid fa-xmark"></i>
-                </button>
+                <button onclick="cerrarModalReporteMovel()" class="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400"><i class="fa-solid fa-xmark"></i></button>
             </div>
             
             <div class="p-5 overflow-y-auto flex-1 space-y-4">
                 <input type="hidden" id="movil-id-orden">
-                
                 <div>
                     <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1">Trabajos Realizados (Descripción Detallada)</label>
                     <textarea id="movil-trabajos" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Describe paso a paso lo que se hizo..."></textarea>
@@ -1663,9 +1221,7 @@ MOBILE_MACHINE_TEMPLATE = """
                     <div class="flex space-x-2">
                         <select id="movil-select-repuesto" class="flex-1 min-w-0 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none truncate"></select>
                         <input type="number" id="movil-input-cant" value="1" min="0.1" step="0.1" class="w-16 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white text-center outline-none">
-                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold">
-                            <i class="fa-solid fa-plus"></i>
-                        </button>
+                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold"><i class="fa-solid fa-plus"></i></button>
                     </div>
                     <ul id="movil-lista-repuestos" class="mt-3 divide-y divide-slate-700/50 max-h-32 overflow-y-auto">
                         <li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>
@@ -1692,72 +1248,33 @@ MOBILE_MACHINE_TEMPLATE = """
         let repuestosUsadosMovil = [];
 
         function showMobileToast(msg, isError = false) {
-            const toast = document.getElementById('mobile-toast');
-            const icon = document.getElementById('mobile-toast-icon');
-            document.getElementById('mobile-toast-msg').innerText = msg;
-            toast.classList.remove('hidden');
-            toast.classList.add('toast-enter-active');
-            
-            if (isError) {
-                toast.classList.replace('bg-slate-800', 'bg-rose-900');
-                toast.classList.replace('border-slate-700', 'border-rose-700');
-                icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
-            } else {
-                toast.classList.replace('bg-rose-900', 'bg-slate-800');
-                toast.classList.replace('border-rose-700', 'border-slate-700');
-                icon.className = "fa-solid fa-circle-check mr-3 text-emerald-400 text-lg";
-            }
-            setTimeout(() => {
-                toast.classList.remove('toast-enter-active');
-                setTimeout(() => toast.classList.add('hidden'), 300);
-            }, 3000);
+            const toast = document.getElementById('mobile-toast'); const icon = document.getElementById('mobile-toast-icon');
+            document.getElementById('mobile-toast-msg').innerText = msg; toast.classList.remove('hidden'); toast.classList.add('toast-enter-active');
+            if (isError) { toast.classList.replace('bg-slate-800', 'bg-rose-900'); toast.classList.replace('border-slate-700', 'border-rose-700'); icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg"; } 
+            else { toast.classList.replace('bg-rose-900', 'bg-slate-800'); toast.classList.replace('border-rose-700', 'border-slate-700'); icon.className = "fa-solid fa-circle-check mr-3 text-emerald-400 text-lg"; }
+            setTimeout(() => { toast.classList.remove('toast-enter-active'); setTimeout(() => toast.classList.add('hidden'), 300); }, 3000);
         }
 
         function abrirModalReporteMovel(idOrden) {
             document.getElementById('movil-id-orden').value = idOrden;
-            
-            document.getElementById('movil-trabajos').value = '';
-            document.getElementById('movil-tiempo').value = '';
-            document.getElementById('movil-equipos').value = '';
-            document.getElementById('movil-obs').value = '';
-            document.getElementById('movil-rec').value = '';
-            document.getElementById('movil-fotos').value = '';
-            
-            const previewContainer = document.getElementById('movil-preview-container');
-            previewContainer.innerHTML = '';
-            previewContainer.classList.add('hidden');
-            
-            evidenciasBase64Movil = [];
-            repuestosUsadosMovil = [];
-            actualizarListaUI();
+            document.getElementById('movil-trabajos').value = ''; document.getElementById('movil-tiempo').value = ''; document.getElementById('movil-equipos').value = ''; document.getElementById('movil-obs').value = ''; document.getElementById('movil-rec').value = ''; document.getElementById('movil-fotos').value = '';
+            const previewContainer = document.getElementById('movil-preview-container'); previewContainer.innerHTML = ''; previewContainer.classList.add('hidden');
+            evidenciasBase64Movil = []; repuestosUsadosMovil = []; actualizarListaUI();
 
-            // COMO EL TÉCNICO YA ESTÁ LOGUEADO, ESTA API SÍ RESPONDERÁ CON LOS REPUESTOS
             fetch('/api/inventario').then(res => res.json()).then(data => {
                 const select = document.getElementById('movil-select-repuesto');
                 select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
-                data.forEach(r => {
-                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} (Stock: ${r.cantidad_actual})</option>`;
-                });
+                data.forEach(r => { if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} (Stock: ${r.cantidad_actual})</option>`; });
             }).catch(err => console.error("Error al cargar repuestos: ", err));
 
-            const modal = document.getElementById('modal-reporte-movil');
-            modal.classList.remove('hidden');
-            setTimeout(() => modal.classList.remove('translate-y-full'), 10);
+            const modal = document.getElementById('modal-reporte-movil'); modal.classList.remove('hidden'); setTimeout(() => modal.classList.remove('translate-y-full'), 10);
         }
 
-        function cerrarModalReporteMovel() {
-            const modal = document.getElementById('modal-reporte-movil');
-            modal.classList.add('translate-y-full');
-            setTimeout(() => modal.classList.add('hidden'), 300);
-        }
+        function cerrarModalReporteMovel() { const modal = document.getElementById('modal-reporte-movil'); modal.classList.add('translate-y-full'); setTimeout(() => modal.classList.add('hidden'), 300); }
 
         function agregarRepuestoMovil() {
-            const select = document.getElementById('movil-select-repuesto');
-            const cant = document.getElementById('movil-input-cant').value;
-            if(!select.value || cant <= 0) { 
-                showMobileToast("Selecciona repuesto y cantidad.", true); 
-                return; 
-            }
+            const select = document.getElementById('movil-select-repuesto'); const cant = document.getElementById('movil-input-cant').value;
+            if(!select.value || cant <= 0) { showMobileToast("Selecciona repuesto y cantidad.", true); return; }
             repuestosUsadosMovil.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
             actualizarListaUI();
         }
@@ -1766,272 +1283,22 @@ MOBILE_MACHINE_TEMPLATE = """
             const ul = document.getElementById('movil-lista-repuestos');
             if(repuestosUsadosMovil.length === 0) { ul.innerHTML = '<li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; }
             ul.innerHTML = '';
-            repuestosUsadosMovil.forEach((item, index) => {
-                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded"><i class="fa-solid fa-xmark"></i></button></li>`;
-            });
+            repuestosUsadosMovil.forEach((item, index) => { ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded"><i class="fa-solid fa-xmark"></i></button></li>`; });
         }
 
         function quitarRepuestoMovil(i) { repuestosUsadosMovil.splice(i, 1); actualizarListaUI(); }
 
         function previewMobileImages(event) {
-            const files = event.target.files;
-            const previewContainer = document.getElementById('movil-preview-container');
-            previewContainer.innerHTML = '';
-            evidenciasBase64Movil = [];
-
-            if(files.length > 0) previewContainer.classList.remove('hidden');
-            else previewContainer.classList.add('hidden');
-
-            Array.from(files).forEach(file => {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const b64 = e.target.result;
-                    evidenciasBase64Movil.push(b64.split(',')[1]);
-                    
-                    const img = document.createElement('img');
-                    img.src = b64;
-                    img.className = 'w-full h-24 object-cover rounded-xl border border-slate-700';
-                    previewContainer.appendChild(img);
-                };
-                reader.readAsDataURL(file);
-            });
+            const files = event.target.files; const previewContainer = document.getElementById('movil-preview-container'); previewContainer.innerHTML = ''; evidenciasBase64Movil = [];
+            if(files.length > 0) previewContainer.classList.remove('hidden'); else previewContainer.classList.add('hidden');
+            Array.from(files).forEach(file => { const reader = new FileReader(); reader.onload = (e) => { const b64 = e.target.result; evidenciasBase64Movil.push(b64.split(',')[1]); const img = document.createElement('img'); img.src = b64; img.className = 'w-full h-24 object-cover rounded-xl border border-slate-700'; previewContainer.appendChild(img); }; reader.readAsDataURL(file); });
         }
 
         function enviarReporteMovil() {
-            const idOrden = document.getElementById('movil-id-orden').value;
-            const btn = document.getElementById('btn-enviar-movil');
-            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Guardando...';
-            btn.disabled = true;
-
-            const payload = {
-                repuestos: repuestosUsadosMovil,
-                observaciones: document.getElementById('movil-obs').value || 'Sin observaciones.',
-                recomendaciones: document.getElementById('movil-rec').value || 'Ninguna recomendación.',
-                trabajos_realizados: document.getElementById('movil-trabajos').value || 'Trabajo completado.',
-                equipos_necesarios: document.getElementById('movil-equipos').value || 'Herramientas estándar.',
-                tiempo_ejecucion: document.getElementById('movil-tiempo').value || 'No especificado',
-                evidencias: evidenciasBase64Movil
-            };
-
-            fetch(`/api/ordenes/completar/${idOrden}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
-            .then(res => res.json())
-            .then(r => {
-                if(r.status === 'ok') {
-                    showMobileToast('Reporte guardado exitosamente.');
-                    cerrarModalReporteMovel();
-                    setTimeout(() => window.location.reload(), 1000);
-                } else {
-                    showMobileToast('Error al guardar reporte.', true);
-                    btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo';
-                    btn.disabled = false;
-                }
-            })
-            .catch(err => {
-                showMobileToast('Error de conexión.', true);
-                btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo';
-                btn.disabled = false;
-            });
+            const idOrden = document.getElementById('movil-id-orden').value; const btn = document.getElementById('btn-enviar-movil'); btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Guardando...'; btn.disabled = true;
+            const payload = { repuestos: repuestosUsadosMovil, observaciones: document.getElementById('movil-obs').value || 'Sin observaciones.', recomendaciones: document.getElementById('movil-rec').value || 'Ninguna recomendación.', trabajos_realizados: document.getElementById('movil-trabajos').value || 'Trabajo completado.', equipos_necesarios: document.getElementById('movil-equipos').value || 'Herramientas estándar.', tiempo_ejecucion: document.getElementById('movil-tiempo').value || 'No especificado', evidencias: evidenciasBase64Movil };
+            fetch(`/api/ordenes/completar/${idOrden}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(res => res.json()).then(r => { if(r.status === 'ok') { showMobileToast('Reporte guardado exitosamente.'); cerrarModalReporteMovel(); setTimeout(() => window.location.reload(), 1000); } else { showMobileToast('Error al guardar reporte.', true); btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo'; btn.disabled = false; } }).catch(err => { showMobileToast('Error de conexión.', true); btn.innerHTML = '<i class="fa-solid fa-flag-checkered mr-2"></i> Intentar de nuevo'; btn.disabled = false; });
         }
-    </script>
-</body>
-</html>
-"""
-
-MONITOR_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="es" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Monitor de Planta | CAFETEC</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Rajdhani:wght@700&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; background-color: #020617; color: white; overflow: hidden; }
-        .fuente-logo { font-family: 'Rajdhani', sans-serif; }
-    </style>
-</head>
-<body class="flex flex-col h-screen p-4 gap-4">
-    <!-- HEADER -->
-    <header class="flex justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-2xl shrink-0">
-        <div class="flex items-center">
-            <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]">
-                <span class="text-cyan-400 font-bold text-4xl fuente-logo tracking-wider">CAFE</span>
-                <span class="text-white font-bold text-4xl fuente-logo tracking-wider ml-1">TEC</span>
-            </div>
-            <span class="ml-6 pl-6 border-l-2 border-slate-700 text-slate-400 uppercase tracking-widest font-bold text-lg flex items-center">
-                <i class="fa-solid fa-tower-broadcast text-rose-500 animate-pulse mr-3"></i> Monitor en Tiempo Real
-            </span>
-        </div>
-        <div class="text-right flex flex-col items-end">
-            <div id="reloj" class="text-4xl font-black text-white tracking-widest font-mono drop-shadow-md">00:00:00</div>
-            <div id="fecha" class="text-cyan-400 text-sm font-bold uppercase mt-1">---</div>
-        </div>
-    </header>
-
-    <!-- MAIN CONTENT -->
-    <main class="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
-        <!-- COL 1: KPIs Principales -->
-        <div class="flex flex-col gap-4 min-h-0">
-            <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center items-center text-center relative overflow-hidden">
-                <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div>
-                <div class="absolute top-4 left-4 flex items-center text-slate-500 text-xs font-bold uppercase tracking-widest">
-                    <i class="fa-solid fa-circle-dot mr-2"></i> Estatus Planta
-                </div>
-                <div id="estado-texto" class="text-[3.5rem] leading-none font-black text-emerald-400 z-10 transition-colors duration-1000 mt-4">OPERATIVA</div>
-            </div>
-            
-            <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center">
-                <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-6 text-sm"><i class="fa-solid fa-list-check mr-2"></i> Progreso de Órdenes (Hoy)</h2>
-                <div class="flex justify-between items-end mb-4">
-                    <div>
-                        <span class="text-[3.5rem] leading-none font-black text-white" id="ordenes-progreso">0/0</span>
-                        <span class="text-slate-500 font-bold ml-2 uppercase text-sm">Completadas</span>
-                    </div>
-                    <span class="text-cyan-400 font-black text-4xl" id="ordenes-porcentaje">0%</span>
-                </div>
-                <div class="w-full bg-slate-950 rounded-full h-6 border border-slate-800 overflow-hidden shadow-inner">
-                    <div class="bg-cyan-500 h-full rounded-full transition-all duration-1000 relative overflow-hidden" id="barra-progreso" style="width: 0%">
-                        <div class="absolute inset-0 bg-white/20 w-full h-full" style="background-image: linear-gradient(45deg,rgba(255,255,255,.15) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.15) 50%,rgba(255,255,255,.15) 75%,transparent 75%,transparent); background-size: 1rem 1rem;"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- COL 2: Gráfico de Disponibilidad -->
-        <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col items-center relative overflow-hidden min-h-0">
-            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div>
-            <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0">
-                <i class="fa-solid fa-chart-pie mr-2"></i> Disponibilidad de Equipos
-            </h2>
-            <div class="flex-1 w-full relative flex items-center justify-center min-h-0">
-                <div class="relative w-full h-full max-h-64 flex justify-center items-center">
-                    <canvas id="chartDisponibilidad"></canvas>
-                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none flex-col mt-4">
-                        <span class="text-6xl font-black text-white drop-shadow-lg" id="disp-porcentaje">100%</span>
-                        <span class="text-sm text-emerald-400 font-bold uppercase tracking-widest mt-1">Online</span>
-                    </div>
-                </div>
-            </div>
-            <div class="w-full mt-4 flex justify-center space-x-6 shrink-0">
-                <div class="flex items-center"><span class="w-4 h-4 rounded-full bg-emerald-500 mr-2 shadow-[0_0_10px_rgba(16,185,129,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">Operativas</span></div>
-                <div class="flex items-center"><span class="w-4 h-4 rounded-full bg-rose-600 mr-2 shadow-[0_0_10px_rgba(225,29,72,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">En Mantenimiento</span></div>
-            </div>
-        </div>
-
-        <!-- COL 3: Equipos Intervenidos -->
-        <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col relative overflow-hidden min-h-0">
-            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div>
-            <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0">
-                <span><i class="fa-solid fa-triangle-exclamation mr-2"></i> Equipos Detenidos</span>
-                <span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span>
-            </h2>
-            <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos">
-                <!-- Se inyecta por JS -->
-                <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50">
-                    <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
-                    <p class="font-bold text-lg">Todos los equipos operativos</p>
-                </div>
-            </div>
-        </div>
-    </main>
-
-    <script>
-        // Reloj
-        function actualizarReloj() {
-            const ahora = new Date();
-            document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
-            const opciones = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
-            let fechaStr = ahora.toLocaleDateString('es-ES', opciones);
-            document.getElementById('fecha').textContent = fechaStr;
-        }
-        setInterval(actualizarReloj, 1000);
-        actualizarReloj();
-
-        let chartDisp = null;
-
-        function actualizarDatos() {
-            fetch('/api/monitor_data')
-                .then(r => r.json())
-                .then(d => {
-                    const totOrd = d.ordenes.total;
-                    const compOrd = d.ordenes.completadas;
-                    document.getElementById('ordenes-progreso').textContent = `${compOrd}/${totOrd}`;
-                    let pctOrd = 100;
-                    if(totOrd > 0) pctOrd = Math.round((compOrd / totOrd) * 100);
-                    
-                    const countUp = (id, target) => {
-                        document.getElementById(id).textContent = target + '%';
-                    };
-                    countUp('ordenes-porcentaje', pctOrd);
-                    document.getElementById('barra-progreso').style.width = `${pctOrd}%`;
-
-                    const totMaq = d.maquinas.total;
-                    const opMaq = d.maquinas.operativas;
-                    const detMaq = d.maquinas.detenidas;
-                    
-                    let estadoGlobal = 'OPERATIVA';
-                    let colorEstado = 'emerald';
-                    if(detMaq.length > 0 && detMaq.length < totMaq) { estadoGlobal = 'OP. PARCIAL'; colorEstado = 'amber'; }
-                    else if(detMaq.length === totMaq && totMaq > 0) { estadoGlobal = 'PARADA GENERAL'; colorEstado = 'rose'; }
-                    
-                    const bgEstado = document.getElementById('bg-estado');
-                    const txtEstado = document.getElementById('estado-texto');
-                    
-                    bgEstado.className = `absolute inset-0 opacity-10 bg-${colorEstado}-500 transition-colors duration-1000`;
-                    txtEstado.className = `text-[3.5rem] leading-none font-black text-${colorEstado}-400 z-10 transition-colors duration-1000 mt-4`;
-                    txtEstado.textContent = estadoGlobal;
-
-                    let pctDisp = 100;
-                    if(totMaq > 0) pctDisp = Math.round((opMaq / totMaq) * 100);
-                    countUp('disp-porcentaje', pctDisp);
-
-                    if(!chartDisp) {
-                        const ctx = document.getElementById('chartDisponibilidad').getContext('2d');
-                        chartDisp = new Chart(ctx, {
-                            type: 'doughnut',
-                            data: { labels: ['Operativas', 'Detenidas'], datasets: [{ data: [opMaq, detMaq.length], backgroundColor: ['#10B981', '#E11D48'], borderWidth: 0 }] },
-                            options: { responsive: true, maintainAspectRatio: false, cutout: '80%', plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateScale: true } }
-                        });
-                    } else {
-                        chartDisp.data.datasets[0].data = [opMaq, detMaq.length];
-                        chartDisp.update();
-                    }
-
-                    document.getElementById('badge-detenidos').textContent = detMaq.length;
-                    const lista = document.getElementById('lista-detenidos');
-                    if(detMaq.length === 0) {
-                        lista.innerHTML = `
-                            <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500">
-                                <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
-                                <p class="font-bold text-lg">Todos los equipos operativos</p>
-                            </div>
-                        `;
-                    } else {
-                        lista.innerHTML = detMaq.map(m => `
-                            <div class="bg-slate-950 border-l-4 border-rose-500 rounded-lg p-4 shadow-md flex items-center justify-between transform transition-all duration-300 hover:scale-105">
-                                <div>
-                                    <div class="font-black text-rose-400 text-lg tracking-wider">${m.codigo_equipo}</div>
-                                    <div class="text-slate-300 font-medium truncate w-48 text-sm">${m.nombre}</div>
-                                </div>
-                                <div class="w-10 h-10 rounded-full bg-rose-900/30 flex items-center justify-center text-rose-500 animate-pulse">
-                                    <i class="fa-solid fa-wrench"></i>
-                                </div>
-                            </div>
-                        `).join('');
-                    }
-                })
-                .catch(err => console.error("Error en monitor:", err));
-        }
-
-        setInterval(actualizarDatos, 5000);
-        actualizarDatos();
     </script>
 </body>
 </html>
@@ -2043,13 +1310,10 @@ MONITOR_TEMPLATE = """
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    # Detectamos a dónde quería ir el usuario antes de pedirle login
     next_url = request.args.get('next') or request.form.get('next')
-    
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        
         conn = get_db_connection()
         user = conn.execute('SELECT * FROM Usuarios WHERE username = ?', (username,)).fetchone()
         conn.close()
@@ -2059,54 +1323,29 @@ def login():
             session['username'] = user['username']
             session['nombre_completo'] = user['nombre_completo']
             session['rol'] = user['rol']
-            
-            # REDIRECCIÓN INTELIGENTE: Si escaneó el QR, lo mandamos a la máquina, si no, al Dashboard.
-            if next_url:
-                return redirect(next_url)
+            if next_url: return redirect(next_url)
             return redirect(url_for('dashboard'))
-            
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
-    
     return render_template_string(LOGIN_TEMPLATE, error=None, next_url=next_url)
 
 @app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
+def logout(): session.clear(); return redirect(url_for('login'))
 
 @app.route('/')
-def dashboard(): 
-    return render_template_string(HTML_TEMPLATE)
+def dashboard(): return render_template_string(HTML_TEMPLATE)
 
 @app.route('/monitor')
-def monitor():
-    return render_template_string(MONITOR_TEMPLATE)
+def monitor(): return render_template_string(MONITOR_TEMPLATE)
 
 @app.route('/maquina/<int:id_maquina>')
 def vista_movil_maquina(id_maquina):
     conn = get_db_connection()
     maquina = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
-    if not maquina:
-        conn.close()
-        return "Máquina no encontrada", 404
-        
-    ordenes_pendientes = conn.execute('''
-        SELECT * FROM Calendario_Mantenimiento 
-        WHERE id_maquina = ? AND estado_orden IN ('Pendiente', 'En Progreso')
-        ORDER BY fecha_programada ASC
-    ''', (id_maquina,)).fetchall()
-    
-    historial = conn.execute('''
-        SELECT * FROM Calendario_Mantenimiento 
-        WHERE id_maquina = ? AND estado_orden = 'Completada'
-        ORDER BY fecha_ejecucion DESC LIMIT 3
-    ''', (id_maquina,)).fetchall()
+    if not maquina: conn.close(); return "Máquina no encontrada", 404
+    ordenes_pendientes = conn.execute("SELECT * FROM Calendario_Mantenimiento WHERE id_maquina = ? AND estado_orden IN ('Pendiente', 'En Progreso') ORDER BY fecha_programada ASC", (id_maquina,)).fetchall()
+    historial = conn.execute("SELECT * FROM Calendario_Mantenimiento WHERE id_maquina = ? AND estado_orden = 'Completada' ORDER BY fecha_ejecucion DESC LIMIT 3", (id_maquina,)).fetchall()
     conn.close()
-    
-    return render_template_string(MOBILE_MACHINE_TEMPLATE, 
-                                  maquina=maquina, 
-                                  ordenes=[dict(o) for o in ordenes_pendientes],
-                                  historial=[dict(h) for h in historial])
+    return render_template_string(MOBILE_MACHINE_TEMPLATE, maquina=maquina, ordenes=[dict(o) for o in ordenes_pendientes], historial=[dict(h) for h in historial])
 
 @app.route('/api/maquinas/etiqueta/<int:id_maquina>')
 def api_etiqueta_qr(id_maquina):
@@ -2114,50 +1353,15 @@ def api_etiqueta_qr(id_maquina):
     m = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
     conn.close()
     if not m: return "Máquina no encontrada", 404
-    
     url_maquina = request.host_url.rstrip('/') + url_for('vista_movil_maquina', id_maquina=id_maquina)
     qr = qrcode.QRCode(version=1, box_size=10, border=1)
     qr.add_data(url_maquina)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    
-    ETIQUETA_HTML = """
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <title>Imprimir Etiqueta QR - {{ m.codigo_equipo }}</title>
-        <style>
-            body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #e2e8f0; margin: 0; }
-            .etiqueta { width: 400px; height: 200px; background: white; border: 2px solid black; display: flex; padding: 10px; box-sizing: border-box; border-radius: 8px;}
-            .info { flex: 1; display: flex; flex-col; flex-direction: column; justify-content: center; padding-right: 10px; }
-            .qr-container { width: 150px; display: flex; justify-content: center; align-items: center; border-left: 2px dashed #cbd5e1; padding-left: 10px; }
-            h1 { margin: 0; font-size: 24px; color: #0f172a; }
-            h2 { margin: 5px 0 0 0; font-size: 14px; color: #64748b; font-weight: normal; }
-            .logo { font-family: Impact, sans-serif; font-size: 20px; font-weight: bold; margin-bottom: 15px; }
-            .logo-c { color: #0ea5e9; }
-            img { max-width: 100%; max-height: 100%; }
-            @media print { body { background: white; } .no-print { display: none; } .etiqueta { border: none; border-radius: 0; } }
-            .btn-imprimir { position: fixed; top: 20px; padding: 10px 20px; background: #0ea5e9; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px;}
-        </style>
-    </head>
-    <body>
-        <button class="btn-imprimir no-print" onclick="window.print()">🖨️ Imprimir Etiqueta</button>
-        <div class="etiqueta">
-            <div class="info">
-                <div class="logo"><span class="logo-c">CAFE</span>TEC</div>
-                <h1>{{ m.codigo_equipo }}</h1>
-                <h2>{{ m.nombre }}</h2>
-            </div>
-            <div class="qr-container"><img src="data:image/png;base64,{{ qr_img }}" alt="QR"></div>
-        </div>
-    </body>
-    </html>
-    """
+    ETIQUETA_HTML = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Imprimir Etiqueta QR - {{ m.codigo_equipo }}</title><style>body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #e2e8f0; margin: 0; } .etiqueta { width: 400px; height: 200px; background: white; border: 2px solid black; display: flex; padding: 10px; box-sizing: border-box; border-radius: 8px;} .info { flex: 1; display: flex; flex-col; flex-direction: column; justify-content: center; padding-right: 10px; } .qr-container { width: 150px; display: flex; justify-content: center; align-items: center; border-left: 2px dashed #cbd5e1; padding-left: 10px; } h1 { margin: 0; font-size: 24px; color: #0f172a; } h2 { margin: 5px 0 0 0; font-size: 14px; color: #64748b; font-weight: normal; } .logo { font-family: Impact, sans-serif; font-size: 20px; font-weight: bold; margin-bottom: 15px; } .logo-c { color: #0ea5e9; } img { max-width: 100%; max-height: 100%; } @media print { body { background: white; } .no-print { display: none; } .etiqueta { border: none; border-radius: 0; } } .btn-imprimir { position: fixed; top: 20px; padding: 10px 20px; background: #0ea5e9; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px;}</style></head><body><button class="btn-imprimir no-print" onclick="window.print()">🖨️ Imprimir Etiqueta</button><div class="etiqueta"><div class="info"><div class="logo"><span class="logo-c">CAFE</span>TEC</div><h1>{{ m.codigo_equipo }}</h1><h2>{{ m.nombre }}</h2></div><div class="qr-container"><img src="data:image/png;base64,{{ qr_img }}" alt="QR"></div></div></body></html>"""
     return render_template_string(ETIQUETA_HTML, m=m, qr_img=img_str)
 
 @app.route('/api/monitor_data')
@@ -2176,16 +1380,12 @@ def api_monitor_data():
 
 @app.route('/api/maquinas')
 def api_maquinas(): return jsonify(obtener_todas_las_maquinas())
-
 @app.route('/api/ordenes')
 def api_ordenes(): return jsonify(obtener_mantenimientos_pendientes())
-
 @app.route('/api/historial')
 def api_historial(): return jsonify(obtener_historial_db())
-
 @app.route('/api/inventario')
 def api_inventario(): return jsonify(obtener_inventario())
-
 @app.route('/api/compras')
 def api_compras(): return jsonify(obtener_historial_compras_db())
 
@@ -2212,7 +1412,7 @@ def api_registrar_compra(id_repuesto):
 def api_nueva_orden():
     if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
     d = request.json
-    crear_nueva_orden_db(d['id_maquina'], d['tipo_mantenimiento'], d['descripcion'], d['fecha'], d['tecnico'])
+    crear_nueva_orden_db(d['id_maquina'], d['tipo_mantenimiento'], d['descripcion'], d['fecha'], d['tecnico'], d.get('codigo_reman_manual', ''))
     return jsonify({"status": "ok"})
 
 @app.route('/api/ordenes/editar/<int:id_orden>', methods=['POST'])
@@ -2268,8 +1468,7 @@ def api_exportar_inventario():
         cell = ws.cell(row=1, column=col_num)
         cell.fill = fill
         cell.font = font
-    for item in inventario: 
-        ws.append([item['codigo_pieza'], item['nombre'], item['descripcion'], item['cantidad_actual'], item['punto_reorden'], item['unidad_medida'], item['ubicacion_almacen']])
+    for item in inventario: ws.append([item['codigo_pieza'], item['nombre'], item['descripcion'], item['cantidad_actual'], item['punto_reorden'], item['unidad_medida'], item['ubicacion_almacen']])
     file_stream = io.BytesIO()
     wb.save(file_stream)
     file_stream.seek(0)
@@ -2289,8 +1488,7 @@ def api_exportar_compras():
         cell = ws.cell(row=1, column=col_num)
         cell.fill = fill
         cell.font = font
-    for item in compras: 
-        ws.append([item['fecha_compra'], item['codigo_pieza'], item['nombre'], item['cantidad'], item['costo_unitario'], item['costo_total'], item['proveedor'], item['factura']])
+    for item in compras: ws.append([item['fecha_compra'], item['codigo_pieza'], item['nombre'], item['cantidad'], item['costo_unitario'], item['costo_total'], item['proveedor'], item['factura']])
     file_stream = io.BytesIO()
     wb.save(file_stream)
     file_stream.seek(0)
@@ -2300,7 +1498,7 @@ def api_exportar_compras():
 def api_descargar_reporte(id_orden):
     conn = get_db_connection()
     query = """
-        SELECT c.id_mantenimiento, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta,
+        SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta,
                c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_programada, c.fecha_ejecucion, 
                c.tecnico_asignado, c.observaciones, c.recomendaciones, 
                c.trabajos_realizados, c.equipos_necesarios, c.tiempo_ejecucion,
@@ -2320,17 +1518,23 @@ def api_descargar_reporte(id_orden):
     title_style = ParagraphStyle(name='Title', fontName='Helvetica-Bold', fontSize=11, spaceAfter=8, spaceBefore=14, textColor=colors.HexColor('#0F172A'))
     normal_style = ParagraphStyle(name='NormalCustom', fontName='Helvetica', fontSize=10, spaceAfter=4, leading=14)
 
-    logo_path = "logo_cafetec.jpg"
+    logo_path = os.path.join(BASE_DIR, "logo_cafetec.jpg")
     celda_logo = Image(logo_path, width=112, height=55, kind='proportional') if os.path.exists(logo_path) else Paragraph("<font color='white'><b>CAFETEC</b></font>", ParagraphStyle(name='LogoFB', alignment=1, fontName='Times-Bold', fontSize=14))
     p_tit_top = Paragraph("REGISTRO DE MANTENIMIENTO", ParagraphStyle(name='TitTop', alignment=1, fontName='Times-Bold', fontSize=11, leading=14))
     p_tit_bot = Paragraph(f"MANTENIMIENTO DE MAQUINA {orden['maquina_nombre'].upper()}", ParagraphStyle(name='TitBot', alignment=1, fontName='Times-Bold', fontSize=10, textColor=colors.HexColor('#004b87'), leading=12)) 
     lbl_style = ParagraphStyle(name='Lbl', alignment=0, fontName='Times-Roman', fontSize=10)
     val_style = ParagraphStyle(name='Val', alignment=0, fontName='Times-Roman', fontSize=10)
-    fecha_format = orden['fecha_ejecucion']
     
-    header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph("RE MAN-262", val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
+    codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
+    fecha_format = orden['fecha_ejecucion']
+    try:
+        f_obj = datetime.strptime(fecha_format, '%Y-%m-%d')
+        fecha_format = f_obj.strftime('%d/%m/%y')
+    except: pass
+    
+    header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph(codigo_pdf, val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
     t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
-    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black)]))
+    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black), ('LEFTPADDING', (0,0), (-1,-1), 4), ('RIGHTPADDING', (0,0), (-1,-1), 4), ('BOTTOMPADDING', (0,0), (-1,-1), 2), ('TOPPADDING', (0,0), (-1,-1), 2)]))
     elements.append(t_header)
     elements.append(Spacer(1, 15))
 
@@ -2352,31 +1556,30 @@ def api_descargar_reporte(id_orden):
     elements.append(Paragraph(f"• {orden['recomendaciones'].replace(chr(10), '<br/>')}", normal_style))
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     if evidencias_db:
+        try: resample_mode = PILImage.Resampling.LANCZOS
+        except AttributeError: resample_mode = PILImage.LANCZOS
         evidencia_data, row = [], []
         for index, row_db in enumerate(evidencias_db):
             try:
                 img_data = base64.b64decode(row_db['imagen_base64'])
-                img_pil = PILImage.open(io.BytesIO(img_data)).convert('RGB')
+                img_pil = PILImage.open(io.BytesIO(img_data))
+                if img_pil.mode in ('RGBA', 'P'): img_pil = img_pil.convert('RGB')
                 w, h = img_pil.size
                 ns = min(w, h)
-                img_pil = img_pil.crop(((w-ns)/2, (h-ns)/2, (w+ns)/2, (h+ns)/2)).resize((300, 300))
+                img_pil = img_pil.crop(((w-ns)/2, (h-ns)/2, (w+ns)/2, (h+ns)/2)).resize((300, 300), resample_mode)
                 output = io.BytesIO()
                 img_pil.save(output, format='JPEG', quality=85)
                 output.seek(0)
                 row.append(Image(output, width=240, height=240))
-                if len(row) == 2:
-                    evidencia_data.append(row)
-                    row = []
+                if len(row) == 2: evidencia_data.append(row); row = []
             except: pass
-        if row: 
-            row.append("")
-            evidencia_data.append(row)
+        if row: row.append(""); evidencia_data.append(row)
         t_evidencia = Table(evidencia_data, colWidths=[255, 255])
-        t_evidencia.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+        t_evidencia.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('BOTTOMPADDING', (0,0), (-1,-1), 8), ('TOPPADDING', (0,0), (-1,-1), 8)]))
         elements.append(t_evidencia)
     else:
         box = Table([["\n\n(Espacio reservado para adjuntar evidencia fotográfica post-impresión)\n\n"]], colWidths=[510])
-        box.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#94a3b8'))]))
+        box.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#94a3b8')), ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#64748b')), ('FONTNAME', (0,0), (-1,-1), 'Helvetica-Oblique')]))
         elements.append(box)
         
     elements.append(Spacer(1, 85))
@@ -2387,7 +1590,9 @@ def api_descargar_reporte(id_orden):
 
     doc.build(elements)
     file_stream.seek(0)
-    return send_file(file_stream, as_attachment=True, download_name=f"RE-MAN-262_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf", mimetype='application/pdf')
+    codigo_seguro = codigo_pdf.replace(" ", "_")
+    nombre_archivo = f"{codigo_seguro}_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf"
+    return send_file(file_stream, as_attachment=True, download_name=nombre_archivo, mimetype='application/pdf')
 
 if __name__ == '__main__':
     print("=====================================================")
