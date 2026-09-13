@@ -183,13 +183,6 @@ def registrar_compra_db(id_repuesto, cantidad, costo, proveedor, factura):
     finally:
         conn.close()
 
-def obtener_historial_compras_db():
-    conn = get_db_connection()
-    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
-    compras = conn.execute(query).fetchall()
-    conn.close()
-    return [dict(ix) for ix in compras]
-
 def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_reman_manual=None):
     conn = get_db_connection()
     
@@ -241,6 +234,7 @@ def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, e
     """Marca una orden como completada, guarda los detalles del reporte, descuenta stock y guarda fotos."""
     hoy = datetime.now().strftime('%Y-%m-%d')
     try:
+        conn = get_db_connection()
         conn.execute("UPDATE Calendario_Mantenimiento SET estado_orden = 'Completada', fecha_ejecucion = ?, observaciones = ?, recomendaciones = ?, trabajos_realizados = ?, equipos_necesarios = ?, tiempo_ejecucion = ? WHERE id_mantenimiento = ?", (hoy, obs, rec, trabajos, equipos, tiempo, id_mantenimiento))
         orden = conn.execute('SELECT id_maquina FROM Calendario_Mantenimiento WHERE id_mantenimiento = ?', (id_mantenimiento,)).fetchone()
         if orden:
@@ -254,7 +248,7 @@ def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, e
             conn.execute('INSERT INTO Evidencia_Fotografica (id_mantenimiento, imagen_base64) VALUES (?, ?)', (id_mantenimiento, b64))
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        print(f"Error al completar orden en BD: {e}")
     finally:
         conn.close()
 
@@ -308,6 +302,13 @@ def obtener_historial_db():
 
     conn.close()
     return historial_lista
+
+def obtener_historial_compras_db():
+    conn = get_db_connection()
+    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
+    compras = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(ix) for ix in compras]
 
 def crear_maquina_db(codigo, nombre, area, criticidad):
     conn = get_db_connection()
@@ -662,7 +663,7 @@ HTML_TEMPLATE = """
                             <span class="text-slate-500 font-bold mr-2 text-sm">RE MAN -</span>
                             <input type="number" id="input-reman-manual" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 text-white" placeholder="Ej: 280">
                         </div>
-                        <p class="text-[9px] text-slate-500 mt-1 mt-1">Usa esto solo si deseas saltar la numeración y empezar desde un número específico.</p>
+                        <p class="text-[9px] text-slate-500 mt-1">Usa esto solo si deseas saltar la numeración y empezar desde un número específico.</p>
                     </div>
 
                     <div class="mb-4">
@@ -1014,15 +1015,13 @@ HTML_TEMPLATE = """
 
         let chartMaquinas = null;
         let chartOrdenes = null;
-        let repuestosDisponiblesDesktop = [];
 
-        // Autorización en Interfaz (Ocultar botones si es Técnico)
+        // --- LÓGICA DE UX POR ROLES ---
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
             document.getElementById('btn-historial-compras')?.classList.add('hidden');
             document.getElementById('btn-add-orden')?.classList.add('hidden');
             document.getElementById('panel-gerencial')?.classList.add('hidden');
-            
             const tituloOrdenes = document.getElementById('titulo-tabla-ordenes');
             if(tituloOrdenes) {
                 tituloOrdenes.innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-500 mr-2"></i> Mis Tareas Pendientes';
@@ -1414,6 +1413,7 @@ HTML_TEMPLATE = """
         // LÓGICA AVANZADA: COMPLETAR ORDEN Y REPORTE
         let repuestosUsadosTemp = [];
         let evidenciasBase64 = [];
+        let repuestosDisponiblesDesktop = [];
         const modalCompletar = document.getElementById('modal-completar');
 
         function abrirModalCompletar(id_orden) {
@@ -2134,7 +2134,6 @@ MONITOR_TEMPLATE = """
     </style>
 </head>
 <body class="flex flex-col h-screen p-4 gap-4">
-    <!-- HEADER -->
     <header class="flex justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-2xl shrink-0">
         <div class="flex items-center">
             <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]">
@@ -2151,9 +2150,7 @@ MONITOR_TEMPLATE = """
         </div>
     </header>
 
-    <!-- MAIN CONTENT -->
     <main class="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
-        <!-- COL 1: KPIs Principales -->
         <div class="flex flex-col gap-4 min-h-0">
             <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center items-center text-center relative overflow-hidden">
                 <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div>
@@ -2180,7 +2177,6 @@ MONITOR_TEMPLATE = """
             </div>
         </div>
 
-        <!-- COL 2: Gráfico de Disponibilidad -->
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col items-center relative overflow-hidden min-h-0">
             <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0">
@@ -2201,7 +2197,6 @@ MONITOR_TEMPLATE = """
             </div>
         </div>
 
-        <!-- COL 3: Equipos Intervenidos -->
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col relative overflow-hidden min-h-0">
             <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0">
@@ -2209,7 +2204,6 @@ MONITOR_TEMPLATE = """
                 <span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span>
             </h2>
             <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos">
-                <!-- Se inyecta por JS -->
                 <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50">
                     <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
                     <p class="font-bold text-lg">Todos los equipos operativos</p>
@@ -2219,7 +2213,6 @@ MONITOR_TEMPLATE = """
     </main>
 
     <script>
-        // Reloj
         function actualizarReloj() {
             const ahora = new Date();
             document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
@@ -2319,9 +2312,7 @@ MONITOR_TEMPLATE = """
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    # Detectamos a dónde quería ir el usuario antes de pedirle login
     next_url = request.args.get('next') or request.form.get('next')
-    
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -2336,13 +2327,10 @@ def login():
             session['nombre_completo'] = user['nombre_completo']
             session['rol'] = user['rol']
             
-            # REDIRECCIÓN INTELIGENTE: Si escaneó el QR, lo mandamos a la máquina, si no, al Dashboard.
-            if next_url:
-                return redirect(next_url)
+            if next_url: return redirect(next_url)
             return redirect(url_for('dashboard'))
             
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
-    
     return render_template_string(LOGIN_TEMPLATE, error=None, next_url=next_url)
 
 @app.route('/logout')
@@ -2580,16 +2568,11 @@ def api_descargar_reporte(id_orden):
                c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_programada, c.fecha_ejecucion, 
                c.tecnico_asignado, c.observaciones, c.recomendaciones, 
                c.trabajos_realizados, c.equipos_necesarios, c.tiempo_ejecucion
-        FROM Calendario_Mantenimiento c
-        JOIN Maquinas m ON c.id_maquina = m.id_maquina
-        WHERE c.id_mantenimiento = ?
+        FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.id_mantenimiento = ?
     """
     orden = conn.execute(query, (id_orden,)).fetchone()
-    
-    # Extraer las evidencias fotográficas asociadas
     evidencias_db = conn.execute("SELECT imagen_base64 FROM Evidencia_Fotografica WHERE id_mantenimiento = ?", (id_orden,)).fetchall()
     
-    # Extraer los repuestos con sus unidades
     repuestos_db = conn.execute("""
         SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre 
         FROM Repuestos_Orden ro 
@@ -2613,31 +2596,53 @@ def api_descargar_reporte(id_orden):
     p_tit_bot = Paragraph(f"MANTENIMIENTO DE MAQUINA {orden['maquina_nombre'].upper()}", ParagraphStyle(name='TitBot', alignment=1, fontName='Times-Bold', fontSize=10, textColor=colors.HexColor('#004b87'), leading=12)) 
     lbl_style = ParagraphStyle(name='Lbl', alignment=0, fontName='Times-Roman', fontSize=10)
     val_style = ParagraphStyle(name='Val', alignment=0, fontName='Times-Roman', fontSize=10)
-    
     fecha_format = orden['fecha_ejecucion']
     try:
         f_obj = datetime.strptime(fecha_format, '%Y-%m-%d')
         fecha_format = f_obj.strftime('%d/%m/%y')
     except: pass
-    
+
     codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
     
     header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph(codigo_pdf, val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
-    # 4. DESCRIPCION / OBSERVACIONES
-    elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
-    trabajos_formateado = formatear_texto_multilinea(orden['trabajos_realizados'])
-    elements.append(Paragraph(trabajos_formateado, normal_style))
+    t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
+    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black)]))
+    elements.append(t_header)
+    elements.append(Spacer(1, 15))
 
-    # RECURSOS NECESARIOS
+    elements.append(Paragraph("1. INFORMACIÓN GENERAL:", title_style))
+    info_text = f"• <b>Fecha de Ejecución:</b> {orden['fecha_ejecucion']}<br/>• <b>Tipo de trabajo a realizar:</b> {orden['tipo_mantenimiento']}<br/>• <b>Código del activo:</b> {orden['codigo_equipo']}<br/>• <b>Nombre de activo:</b> {orden['maquina_nombre']}<br/>• <b>Técnico a cargo:</b> {orden['tecnico_asignado']}<br/>• <b>Duración:</b> {orden['tiempo_ejecucion']}"
+    elements.append(Paragraph(info_text, normal_style))
+    elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
+    elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
+    
+    # FUNCION INTELIGENTE DE VIÑETAS
+    def formatear_texto_multilinea(texto):
+        if not texto: return "• Ninguno."
+        lineas = texto.split('\n')
+        lineas_formateadas = []
+        for linea in lineas:
+            l = linea.strip()
+            if l:
+                if l.startswith('-') or l.startswith('•') or l.startswith('*'):
+                    lineas_formateadas.append(l) 
+                else:
+                    lineas_formateadas.append(f"• {l}")
+        return "<br/>".join(lineas_formateadas)
+
+    elements.append(Paragraph("3. OBSERVACIONES:", title_style))
+    elements.append(Paragraph(formatear_texto_multilinea(orden['observaciones']), normal_style))
+
+    elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
+    elements.append(Paragraph(formatear_texto_multilinea(orden['trabajos_realizados']), normal_style))
+
     elements.append(Paragraph("RECURSOS NECESARIOS:", title_style))
     
-    # Formateo inteligente de cantidades para el reporte
     rep_strs = []
     for r in repuestos_db:
         c_val = r['cantidad_usada']
         c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
         u_str = r['unidad_medida'].strip()
-        
         if c_val == 1:
             if u_str.lower() in ['galones', 'galón']: u_str = 'Galón'
             elif u_str.lower() == 'unidades': u_str = 'Unidad'
@@ -2649,26 +2654,15 @@ def api_descargar_reporte(id_orden):
             if u_str.lower() in ['unidad', 'metro', 'litro', 'caja', 'rollo', 'paquete']: u_str += 's'
             elif u_str.lower() in ['galon', 'galón']: u_str = 'Galones'
             elif u_str.lower() == 'par': u_str = 'Pares'
-        
         rep_strs.append(f"• {c_str} {u_str} de {r['nombre']}")
         
     rep_text = "<br/>".join(rep_strs) if rep_strs else "<i>No se utilizaron repuestos de almacén.</i>"
-        
-    equipos_list = orden['equipos_necesarios'].split(',')
-    equipos_text = "<br/>".join([f"• {e.strip()}" for e in equipos_list if e.strip()])
-    if not equipos_text: equipos_text = "• Herramientas manuales estándar"
-
-    recursos_text = f"""
-    <b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/>
-    <b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/>
-    <b>Materiales y repuestos:</b><br/>{rep_text}
-    """
+    equipos_text = "<br/>".join([f"• {e.strip()}" for e in orden['equipos_necesarios'].split(',') if e.strip()]) or "• Herramientas manuales estándar"
+    recursos_text = f"<b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/><b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/><b>Materiales y repuestos:</b><br/>{rep_text}"
     elements.append(Paragraph(recursos_text, normal_style))
-
-    # 5. COMENTARIOS / RECOMENDACIONES
+    
     elements.append(Paragraph("5. COMENTARIOS / RECOMENDACIONES:", title_style))
-    rec_formateado = formatear_texto_multilinea(orden['recomendaciones'])
-    elements.append(Paragraph(rec_formateado, normal_style))
+    elements.append(Paragraph(formatear_texto_multilinea(orden['recomendaciones']), normal_style))
     
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     if evidencias_db:
@@ -2707,7 +2701,6 @@ def api_descargar_reporte(id_orden):
 
     doc.build(elements)
     file_stream.seek(0)
-    
     codigo_seguro = codigo_pdf.replace(" ", "_")
     return send_file(file_stream, as_attachment=True, download_name=f"{codigo_seguro}_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf", mimetype='application/pdf')
 
