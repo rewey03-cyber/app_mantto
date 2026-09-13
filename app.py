@@ -238,7 +238,7 @@ def eliminar_orden_db(id_orden):
     conn.close()
 
 def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, equipos, tiempo, evidencias=[]):
-    conn = get_db_connection()
+    """Marca una orden como completada, guarda los detalles del reporte, descuenta stock y guarda fotos."""
     hoy = datetime.now().strftime('%Y-%m-%d')
     try:
         conn.execute("UPDATE Calendario_Mantenimiento SET estado_orden = 'Completada', fecha_ejecucion = ?, observaciones = ?, recomendaciones = ?, trabajos_realizados = ?, equipos_necesarios = ?, tiempo_ejecucion = ? WHERE id_mantenimiento = ?", (hoy, obs, rec, trabajos, equipos, tiempo, id_mantenimiento))
@@ -260,10 +260,54 @@ def completar_orden_db(id_mantenimiento, repuestos_usados, obs, rec, trabajos, e
 
 def obtener_historial_db():
     conn = get_db_connection()
-    query = "SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta, c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_ejecucion, c.tecnico_asignado, c.tiempo_ejecucion, (SELECT GROUP_CONCAT(ro.cantidad_usada || ' ' || rs.unidad_medida || ' de ' || rs.nombre, '\n') FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = c.id_mantenimiento) as repuestos_usados FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.estado_orden = 'Completada' ORDER BY c.fecha_ejecucion DESC"
+    query = """
+        SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta,
+               c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_ejecucion, 
+               c.tecnico_asignado, c.tiempo_ejecucion
+        FROM Calendario_Mantenimiento c
+        JOIN Maquinas m ON c.id_maquina = m.id_maquina
+        WHERE c.estado_orden = 'Completada'
+        ORDER BY c.fecha_ejecucion DESC
+    """
     historial = conn.execute(query).fetchall()
+    
+    # Formateo inteligente de unidades y decimales
+    historial_lista = []
+    for h in historial:
+        h_dict = dict(h)
+        rep_query = """
+            SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre 
+            FROM Repuestos_Orden ro 
+            JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto 
+            WHERE ro.id_mantenimiento = ?
+        """
+        repuestos = conn.execute(rep_query, (h['id_mantenimiento'],)).fetchall()
+        
+        rep_strs = []
+        for r in repuestos:
+            c_val = r['cantidad_usada']
+            c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
+            u_str = r['unidad_medida'].strip()
+            
+            if c_val == 1:
+                if u_str.lower() in ['galones', 'galón']: u_str = 'Galón'
+                elif u_str.lower() == 'unidades': u_str = 'Unidad'
+                elif u_str.lower() == 'metros': u_str = 'Metro'
+                elif u_str.lower() == 'litros': u_str = 'Litro'
+                elif u_str.lower() == 'cajas': u_str = 'Caja'
+                elif u_str.lower() == 'pares': u_str = 'Par'
+            else:
+                if u_str.lower() in ['unidad', 'metro', 'litro', 'caja', 'rollo', 'paquete']: u_str += 's'
+                elif u_str.lower() in ['galon', 'galón']: u_str = 'Galones'
+                elif u_str.lower() == 'par': u_str = 'Pares'
+            
+            rep_strs.append(f"{c_str} {u_str} de {r['nombre']}")
+            
+        h_dict['repuestos_usados'] = '\n'.join(rep_strs)
+        historial_lista.append(h_dict)
+
     conn.close()
-    return [dict(ix) for ix in historial]
+    return historial_lista
 
 def crear_maquina_db(codigo, nombre, area, criticidad):
     conn = get_db_connection()
@@ -2535,13 +2579,24 @@ def api_descargar_reporte(id_orden):
         SELECT c.id_mantenimiento, c.codigo_reman, m.codigo_equipo, m.nombre AS maquina_nombre, m.area_planta,
                c.tipo_mantenimiento, c.descripcion_tarea, c.fecha_programada, c.fecha_ejecucion, 
                c.tecnico_asignado, c.observaciones, c.recomendaciones, 
-               c.trabajos_realizados, c.equipos_necesarios, c.tiempo_ejecucion,
-               (SELECT GROUP_CONCAT(ro.cantidad_usada || ' ' || rs.unidad_medida || ' de ' || rs.nombre, '\n')
-                FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = c.id_mantenimiento) as repuestos_usados
-        FROM Calendario_Mantenimiento c JOIN Maquinas m ON c.id_maquina = m.id_maquina WHERE c.id_mantenimiento = ?
+               c.trabajos_realizados, c.equipos_necesarios, c.tiempo_ejecucion
+        FROM Calendario_Mantenimiento c
+        JOIN Maquinas m ON c.id_maquina = m.id_maquina
+        WHERE c.id_mantenimiento = ?
     """
     orden = conn.execute(query, (id_orden,)).fetchone()
+    
+    # Extraer las evidencias fotográficas asociadas
     evidencias_db = conn.execute("SELECT imagen_base64 FROM Evidencia_Fotografica WHERE id_mantenimiento = ?", (id_orden,)).fetchall()
+    
+    # Extraer los repuestos con sus unidades
+    repuestos_db = conn.execute("""
+        SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre 
+        FROM Repuestos_Orden ro 
+        JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto 
+        WHERE ro.id_mantenimiento = ?
+    """, (id_orden,)).fetchall()
+    
     conn.close()
 
     if not orden: return "Orden no encontrada", 404
@@ -2568,49 +2623,49 @@ def api_descargar_reporte(id_orden):
     codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
     
     header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph(codigo_pdf, val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
-    t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
-    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black)]))
-    elements.append(t_header)
-    elements.append(Spacer(1, 15))
-
-    # --- FUNCIÓN HELPER PARA LIMPIEZA INTELIGENTE DE VIÑETAS ---
-    def formatear_texto_multilinea(texto):
-        if not texto: return "• Ninguno."
-        lineas = texto.split('\n')
-        lineas_formateadas = []
-        for linea in lineas:
-            l = linea.strip()
-            if l:
-                # Si la línea ya tiene un guion o viñeta natural, se respeta sin agregarle un punto extra.
-                if l.startswith('-') or l.startswith('•') or l.startswith('*'):
-                    lineas_formateadas.append(l) 
-                else:
-                    lineas_formateadas.append(f"• {l}")
-        return "<br/>".join(lineas_formateadas)
-
-    elements.append(Paragraph("1. INFORMACIÓN GENERAL:", title_style))
-    info_text = f"• <b>Fecha de Ejecución:</b> {orden['fecha_ejecucion']}<br/>• <b>Tipo de trabajo a realizar:</b> {orden['tipo_mantenimiento']}<br/>• <b>Código del activo:</b> {orden['codigo_equipo']}<br/>• <b>Nombre de activo:</b> {orden['maquina_nombre']}<br/>• <b>Técnico a cargo:</b> {orden['tecnico_asignado']}<br/>• <b>Duración:</b> {orden['tiempo_ejecucion']}"
-    elements.append(Paragraph(info_text, normal_style))
-    
-    elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
-    elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
-    
-    # --- CAMBIO A SOLICITUD: APARTADO 3 AHORA ES OBSERVACIONES ---
-    elements.append(Paragraph("3. OBSERVACIONES:", title_style))
-    obs_formateado = formatear_texto_multilinea(orden['observaciones'])
-    elements.append(Paragraph(obs_formateado, normal_style))
-    
-    # --- CAMBIO A SOLICITUD: APARTADO 4 AHORA ES TRABAJOS REALIZADOS ---
+    # 4. DESCRIPCION / OBSERVACIONES
     elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
     trabajos_formateado = formatear_texto_multilinea(orden['trabajos_realizados'])
     elements.append(Paragraph(trabajos_formateado, normal_style))
-    
+
+    # RECURSOS NECESARIOS
     elements.append(Paragraph("RECURSOS NECESARIOS:", title_style))
-    rep_text = "• " + orden['repuestos_usados'].replace('\n', '<br/>• ') if orden['repuestos_usados'] else "<i>No se utilizaron repuestos de almacén.</i>"
-    equipos_text = "<br/>".join([f"• {e.strip()}" for e in orden['equipos_necesarios'].split(',') if e.strip()]) or "• Herramientas manuales estándar"
-    recursos_text = f"<b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/><b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/><b>Materiales y repuestos:</b><br/>{rep_text}"
-    elements.append(Paragraph(recursos_text, normal_style))
     
+    # Formateo inteligente de cantidades para el reporte
+    rep_strs = []
+    for r in repuestos_db:
+        c_val = r['cantidad_usada']
+        c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
+        u_str = r['unidad_medida'].strip()
+        
+        if c_val == 1:
+            if u_str.lower() in ['galones', 'galón']: u_str = 'Galón'
+            elif u_str.lower() == 'unidades': u_str = 'Unidad'
+            elif u_str.lower() == 'metros': u_str = 'Metro'
+            elif u_str.lower() == 'litros': u_str = 'Litro'
+            elif u_str.lower() == 'cajas': u_str = 'Caja'
+            elif u_str.lower() == 'pares': u_str = 'Par'
+        else:
+            if u_str.lower() in ['unidad', 'metro', 'litro', 'caja', 'rollo', 'paquete']: u_str += 's'
+            elif u_str.lower() in ['galon', 'galón']: u_str = 'Galones'
+            elif u_str.lower() == 'par': u_str = 'Pares'
+        
+        rep_strs.append(f"• {c_str} {u_str} de {r['nombre']}")
+        
+    rep_text = "<br/>".join(rep_strs) if rep_strs else "<i>No se utilizaron repuestos de almacén.</i>"
+        
+    equipos_list = orden['equipos_necesarios'].split(',')
+    equipos_text = "<br/>".join([f"• {e.strip()}" for e in equipos_list if e.strip()])
+    if not equipos_text: equipos_text = "• Herramientas manuales estándar"
+
+    recursos_text = f"""
+    <b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/>
+    <b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/>
+    <b>Materiales y repuestos:</b><br/>{rep_text}
+    """
+    elements.append(Paragraph(recursos_text, normal_style))
+
+    # 5. COMENTARIOS / RECOMENDACIONES
     elements.append(Paragraph("5. COMENTARIOS / RECOMENDACIONES:", title_style))
     rec_formateado = formatear_texto_multilinea(orden['recomendaciones'])
     elements.append(Paragraph(rec_formateado, normal_style))
