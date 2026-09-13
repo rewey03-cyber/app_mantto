@@ -63,8 +63,6 @@ def requerir_login():
     rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update']
     
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
-        # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR) para redirigirlo tras el login
-        # Evitamos guardar rutas API ocultas para no causar ciclos infinitos
         next_url = request.url if request.endpoint == 'vista_movil_maquina' else None
         return redirect(url_for('login', next=next_url))
 
@@ -110,8 +108,7 @@ def migrar_base_datos():
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
     
-    # ATENCIÓN: Removido el UNIQUE de codigo_reman para evitar bloqueos en SQLite al actualizar tablas existentes.
-    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
     
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
@@ -134,8 +131,55 @@ def migrar_base_datos():
     conn.commit()
     conn.close()
 
-# Forzamos la ejecución al cargar el archivo para asegurar que la BD está íntegra (Resuelve el error 500)
+# Forzamos la ejecución para reparar y actualizar base de datos en PythonAnywhere
 migrar_base_datos()
+
+# --- HELPER DE FORMATEO INTELIGENTE DE CANTIDADES ---
+def formatear_repuesto(cantidad, unidad_medida, nombre):
+    """Convierte '4.0 Unidad' en '4 Unidades' y '1.0 Galones' en '1 Galón' inteligentemente"""
+    c_val = float(cantidad)
+    c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
+    u_str = str(unidad_medida).strip()
+    u_str_lower = u_str.lower()
+    
+    if c_val == 1:
+        if u_str_lower in ['galones', 'galón', 'galon']: u_str = 'Galón'
+        elif u_str_lower in ['unidades', 'unidad']: u_str = 'Unidad'
+        elif u_str_lower in ['metros', 'metro']: u_str = 'Metro'
+        elif u_str_lower in ['litros', 'litro']: u_str = 'Litro'
+        elif u_str_lower in ['cajas', 'caja']: u_str = 'Caja'
+        elif u_str_lower in ['pares', 'par']: u_str = 'Par'
+        elif u_str_lower in ['rollos', 'rollo']: u_str = 'Rollo'
+        elif u_str_lower in ['paquetes', 'paquete']: u_str = 'Paquete'
+        elif u_str_lower in ['piezas', 'pieza']: u_str = 'Pieza'
+        elif u_str_lower in ['kilogramos', 'kilos', 'kg', 'kilogramo', 'kilo']: u_str = 'Kg'
+    else:
+        if u_str_lower in ['unidad', 'unidades']: u_str = 'Unidades'
+        elif u_str_lower in ['metro', 'metros']: u_str = 'Metros'
+        elif u_str_lower in ['litro', 'litros']: u_str = 'Litros'
+        elif u_str_lower in ['caja', 'cajas']: u_str = 'Cajas'
+        elif u_str_lower in ['rollo', 'rollos']: u_str = 'Rollos'
+        elif u_str_lower in ['paquete', 'paquetes']: u_str = 'Paquetes'
+        elif u_str_lower in ['pieza', 'piezas']: u_str = 'Piezas'
+        elif u_str_lower in ['galon', 'galón', 'galones']: u_str = 'Galones'
+        elif u_str_lower in ['par', 'pares']: u_str = 'Pares'
+        elif u_str_lower in ['kilogramos', 'kilos', 'kg', 'kilogramo', 'kilo']: u_str = 'Kg'
+        
+    return f"{c_str} {u_str} de {nombre}"
+
+def formatear_texto_multilinea(texto):
+    """Evita viñetas dobles cuando el técnico ya digitó guiones o viñetas"""
+    if not texto: return "• Ninguno."
+    lineas = texto.split('\n')
+    lineas_formateadas = []
+    for linea in lineas:
+        l = linea.strip()
+        if l:
+            if l.startswith('-') or l.startswith('•') or l.startswith('*'):
+                lineas_formateadas.append(l) 
+            else:
+                lineas_formateadas.append(f"• {l}")
+    return "<br/>".join(lineas_formateadas)
 
 def obtener_todas_las_maquinas():
     conn = get_db_connection()
@@ -190,13 +234,11 @@ def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_r
     codigo_final = ""
     
     if codigo_reman_manual and str(codigo_reman_manual).strip():
-        # Si el administrador forzó un número (ej. "280")
         if not str(codigo_reman_manual).upper().startswith("RE MAN-"):
             codigo_final = f"RE MAN-{str(codigo_reman_manual).strip()}"
         else:
             codigo_final = str(codigo_reman_manual).strip().upper()
     else:
-        # Autogeneración dinámica
         cursor = conn.cursor()
         cursor.execute("SELECT codigo_reman FROM Calendario_Mantenimiento WHERE codigo_reman LIKE 'RE MAN-%' ORDER BY id_mantenimiento DESC LIMIT 1")
         ultimo = cursor.fetchone()
@@ -265,38 +307,13 @@ def obtener_historial_db():
     """
     historial = conn.execute(query).fetchall()
     
-    # Formateo inteligente de unidades y decimales
     historial_lista = []
     for h in historial:
         h_dict = dict(h)
-        rep_query = """
-            SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre 
-            FROM Repuestos_Orden ro 
-            JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto 
-            WHERE ro.id_mantenimiento = ?
-        """
+        rep_query = "SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = ?"
         repuestos = conn.execute(rep_query, (h['id_mantenimiento'],)).fetchall()
         
-        rep_strs = []
-        for r in repuestos:
-            c_val = r['cantidad_usada']
-            c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
-            u_str = r['unidad_medida'].strip()
-            
-            if c_val == 1:
-                if u_str.lower() in ['galones', 'galón']: u_str = 'Galón'
-                elif u_str.lower() == 'unidades': u_str = 'Unidad'
-                elif u_str.lower() == 'metros': u_str = 'Metro'
-                elif u_str.lower() == 'litros': u_str = 'Litro'
-                elif u_str.lower() == 'cajas': u_str = 'Caja'
-                elif u_str.lower() == 'pares': u_str = 'Par'
-            else:
-                if u_str.lower() in ['unidad', 'metro', 'litro', 'caja', 'rollo', 'paquete']: u_str += 's'
-                elif u_str.lower() in ['galon', 'galón']: u_str = 'Galones'
-                elif u_str.lower() == 'par': u_str = 'Pares'
-            
-            rep_strs.append(f"{c_str} {u_str} de {r['nombre']}")
-            
+        rep_strs = [formatear_repuesto(r['cantidad_usada'], r['unidad_medida'], r['nombre']) for r in repuestos]
         h_dict['repuestos_usados'] = '\n'.join(rep_strs)
         historial_lista.append(h_dict)
 
@@ -405,23 +422,18 @@ HTML_TEMPLATE = """
     </script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
-    
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
-        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
-        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
-        
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
@@ -458,11 +470,9 @@ HTML_TEMPLATE = """
                     <a href="/monitor" target="_blank" class="hidden sm:flex text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg items-center shadow-inner font-bold text-xs" title="Abrir Monitor de Planta">
                         <i class="fa-solid fa-display mr-2"></i> Monitor
                     </a>
-
                     <button onclick="toggleTheme()" class="text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 p-2.5 rounded-full w-10 h-10 flex justify-center items-center shadow-inner" title="Cambiar Tema">
                         <i id="theme-icon" class="fa-solid fa-sun"></i>
                     </button>
-
                     <!-- Panel de Usuario y Logout -->
                     <div class="text-sm font-medium bg-slate-900 pl-4 pr-2 py-1.5 rounded-full border border-slate-800 shadow-inner flex items-center text-slate-200">
                         <div class="flex flex-col text-right mr-3 leading-tight hidden sm:flex">
@@ -485,7 +495,6 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
-        <!-- Panel Gerencial a ocultar para Técnicos -->
         <div id="panel-gerencial">
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
                 <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
@@ -549,7 +558,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- TABLAS PRINCIPALES -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <!-- 1. Tabla de Órdenes -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
@@ -955,7 +963,7 @@ HTML_TEMPLATE = """
     </main>
 
     <script>
-        // --- LOGICA DE TEMA (DARK/LIGHT) ---
+        // --- LOGICA DE TEMA Y NOTIFICACIONES ---
         function toggleTheme() {
             const html = document.documentElement;
             const isDark = html.classList.contains('dark');
@@ -987,7 +995,6 @@ HTML_TEMPLATE = """
         }
         applySavedTheme();
 
-        // --- SISTEMA DE NOTIFICACIONES ---
         function mostrarNotificacion(mensaje, tipo='info') {
             const toast = document.getElementById('toast-notificacion');
             const icon = document.getElementById('toast-icon');
@@ -1016,19 +1023,16 @@ HTML_TEMPLATE = """
         let chartMaquinas = null;
         let chartOrdenes = null;
 
-        // --- LÓGICA DE UX POR ROLES ---
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
             document.getElementById('btn-historial-compras')?.classList.add('hidden');
             document.getElementById('btn-add-orden')?.classList.add('hidden');
             document.getElementById('panel-gerencial')?.classList.add('hidden');
             const tituloOrdenes = document.getElementById('titulo-tabla-ordenes');
-            if(tituloOrdenes) {
-                tituloOrdenes.innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-500 mr-2"></i> Mis Tareas Pendientes';
-            }
+            if(tituloOrdenes) tituloOrdenes.innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-500 mr-2"></i> Mis Tareas Pendientes';
         }
 
-        // Cargar Máquinas
+        // --- CARGA INICIAL DE DATOS ---
         fetch('/api/maquinas')
             .then(response => response.json())
             .then(data => {
@@ -1103,7 +1107,6 @@ HTML_TEMPLATE = """
                 });
             });
 
-        // Cargar Órdenes
         fetch('/api/ordenes')
             .then(response => response.json())
             .then(data => {
@@ -1126,7 +1129,7 @@ HTML_TEMPLATE = """
                                 <button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>
                             `;
                         }
-                        
+
                         let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
 
                         html += `
@@ -1166,18 +1169,10 @@ HTML_TEMPLATE = """
                         labels: ['Preventivo', 'Correctivo', 'Predictivo'],
                         datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }]
                     },
-                    options: { 
-                        responsive: true, maintainAspectRatio: false, 
-                        plugins: { legend: { display: false } }, 
-                        scales: { 
-                            y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, 
-                            x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } 
-                        } 
-                    }
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } }
                 });
             });
 
-        // Cargar Inventario
         fetch('/api/inventario')
             .then(response => response.json())
             .then(data => {
@@ -1280,7 +1275,6 @@ HTML_TEMPLATE = """
         function filtrarInventario() { const txt = document.getElementById('buscador-inventario').value.toLowerCase(); document.querySelectorAll('#tabla-inventario tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
         function filtrarMaquinas() { const txt = document.getElementById('buscador-maquinas').value.toLowerCase(); document.querySelectorAll('#tabla-maquinas tr').forEach(row => { row.style.display = row.innerText.toLowerCase().includes(txt) ? '' : 'none'; }); }
 
-        // MODAL COMPRAS
         function abrirModalCompra(id_repuesto, codigo, nombre) {
             document.getElementById('compra-id-repuesto').value = id_repuesto;
             document.getElementById('compra-subtitulo').innerText = `${codigo} - ${nombre}`;
@@ -1329,7 +1323,6 @@ HTML_TEMPLATE = """
         }
         function cerrarModalCompras() { document.getElementById('modal-historial-compras').classList.add('hidden'); }
 
-        // MODAL ÓRDENES
         function abrirModalOrden() { 
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-400 mr-2"></i> Programar Orden';
             document.getElementById('form-nueva-orden').reset();
@@ -1372,9 +1365,7 @@ HTML_TEMPLATE = """
             });
         }
 
-        function cerrarModalOrden() { 
-            document.getElementById('modal-orden').classList.add('hidden'); 
-        }
+        function cerrarModalOrden() { document.getElementById('modal-orden').classList.add('hidden'); }
 
         function guardarOrden(e) { 
             e.preventDefault(); 
@@ -1389,7 +1380,6 @@ HTML_TEMPLATE = """
             };
 
             const endpoint = id_orden ? `/api/ordenes/editar/${id_orden}` : '/api/ordenes/nueva';
-            
             fetch(endpoint, {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
@@ -1402,15 +1392,8 @@ HTML_TEMPLATE = """
         function abrirModalMaquina() { document.getElementById('modal-maquina').classList.remove('hidden'); }
         function cerrarModalMaquina() { document.getElementById('modal-maquina').classList.add('hidden'); document.getElementById('form-nueva-maquina').reset(); }
         function guardarMaquina(e) { e.preventDefault(); fetch('/api/maquinas/nueva',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({codigo:document.getElementById('input-maq-codigo').value, nombre:document.getElementById('input-maq-nombre').value, area:document.getElementById('select-maq-area').value, criticidad:document.getElementById('select-maq-criticidad').value})}).then(r=>r.json()).then(res=>{if(res.status==='ok') window.location.reload();}); }
-        
-        function eliminarMaquina(id) { 
-            fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{
-                if(res.status==='ok') window.location.reload(); 
-                else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error');
-            }); 
-        }
+        function eliminarMaquina(id) { fetch(`/api/maquinas/eliminar/${id}`,{method:'DELETE'}).then(r=>r.json()).then(res=>{if(res.status==='ok') window.location.reload(); else mostrarNotificacion('No se puede eliminar: Protegido por auditoría.', 'error');}); }
 
-        // LÓGICA AVANZADA: COMPLETAR ORDEN Y REPORTE
         let repuestosUsadosTemp = [];
         let evidenciasBase64 = [];
         let repuestosDisponiblesDesktop = [];
@@ -1425,7 +1408,6 @@ HTML_TEMPLATE = """
             document.getElementById('input-equipos').value = '';
             document.getElementById('input-tiempo').value = '';
             
-            // Limpiar área fotográfica
             document.getElementById('input-fotos').value = '';
             document.getElementById('preview-fotos').innerHTML = '';
             
@@ -1433,7 +1415,6 @@ HTML_TEMPLATE = """
             evidenciasBase64 = [];
             actualizarListaUI();
             
-            // Lógica Dropdown Escritorio
             document.getElementById('escritorio-search-repuesto').value = '';
             document.getElementById('escritorio-id-repuesto-selected').value = '';
             document.getElementById('escritorio-nombre-repuesto-selected').value = '';
@@ -1448,7 +1429,6 @@ HTML_TEMPLATE = """
 
         function cerrarModalCompletar() { modalCompletar.classList.add('hidden'); }
         
-        // --- DROPDOWN INTELIGENTE ESCRITORIO ---
         function renderDesktopDropdown(list) {
             const ul = document.getElementById('escritorio-dropdown-list');
             ul.innerHTML = '';
@@ -1498,7 +1478,6 @@ HTML_TEMPLATE = """
             repuestosUsadosTemp.push({ id_repuesto: idRep, nombre: nombreRep, cantidad: cant });
             actualizarListaUI();
             
-            // Limpiar campos
             document.getElementById('escritorio-search-repuesto').value = '';
             document.getElementById('escritorio-id-repuesto-selected').value = '';
             document.getElementById('escritorio-nombre-repuesto-selected').value = '';
@@ -1528,7 +1507,7 @@ HTML_TEMPLATE = """
                 };
                 reader.readAsDataURL(file);
             });
-            event.target.value = ''; // Resetea el input para permitir subir la misma foto si se equivocó
+            event.target.value = '';
         }
         
         function renderDesktopImages() {
@@ -1575,7 +1554,6 @@ HTML_TEMPLATE = """
             }).then(res => res.json()).then(r => { if(r.status === 'ok') window.location.reload(); });
         }
 
-        // HISTORIAL DE AUDITORÍA (PDF)
         function abrirModalHistorial() {
             fetch('/api/historial').then(res => res.json()).then(data => {
                 let html = '';
@@ -1636,7 +1614,6 @@ HTML_TEMPLATE = """
                 cerrarModalAlertas();
             }
             
-            // Cerrar Dropdowns al hacer click afuera
             const dropDesktop = document.getElementById('escritorio-dropdown-container');
             if (dropDesktop && !dropDesktop.contains(e.target)) {
                 document.getElementById('escritorio-dropdown-list')?.classList.add('hidden');
@@ -1673,13 +1650,11 @@ MOBILE_MACHINE_TEMPLATE = """
 </head>
 <body class="pb-20 relative">
 
-    <!-- Toast Notification (Mobile) -->
     <div id="mobile-toast" class="fixed bottom-5 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-3 rounded-xl shadow-2xl border border-slate-700 z-[100] flex items-center w-11/12 max-w-sm toast-enter hidden">
         <i id="mobile-toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="mobile-toast-msg" class="text-sm font-semibold">Mensaje</span>
     </div>
 
-    <!-- Header Fijo -->
     <header class="bg-slate-900 border-b border-slate-800 p-4 sticky top-0 z-50 shadow-lg flex justify-between items-center">
         <div class="flex flex-col">
             <span class="text-cyan-400 font-bold text-sm tracking-widest uppercase">Perfil de Máquina</span>
@@ -1691,7 +1666,6 @@ MOBILE_MACHINE_TEMPLATE = """
     </header>
 
     <div class="p-4 space-y-6">
-        <!-- 1. Tarjeta Principal de la Máquina -->
         <div class="bg-slate-900 rounded-2xl p-5 border border-slate-800 shadow-xl relative overflow-hidden">
             {% if maquina.estado == 'Operativa' %}
                 <div class="absolute left-0 top-0 bottom-0 w-1.5 bg-emerald-500"></div>
@@ -1718,7 +1692,6 @@ MOBILE_MACHINE_TEMPLATE = """
             </div>
         </div>
 
-        <!-- 2. Sección de Órdenes Pendientes -->
         <div>
             <div class="flex justify-between items-center mb-3 ml-1">
                 <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs flex items-center">
@@ -1746,7 +1719,6 @@ MOBILE_MACHINE_TEMPLATE = """
                             </div>
                             <p class="text-sm font-medium text-slate-200 mb-3">{{ orden.descripcion_tarea }}</p>
                             
-                            <!-- Botón para Completar Orden Directamente -->
                             <button onclick="abrirModalReporteMovel({{ orden.id_mantenimiento }})" class="w-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-white font-bold py-2.5 rounded-lg text-sm transition-colors border border-slate-700 flex justify-center items-center shadow-inner">
                                 <i class="fa-solid fa-file-signature mr-2 text-cyan-400"></i> Generar Reporte
                             </button>
@@ -1757,7 +1729,6 @@ MOBILE_MACHINE_TEMPLATE = """
             {% endif %}
         </div>
 
-        <!-- 3. Historial Rápido de Intervenciones -->
         <div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs mt-6 mb-3 ml-1 flex items-center">
                 <i class="fa-solid fa-clock-rotate-left mr-2 text-slate-500"></i> Últimas Intervenciones
@@ -1786,7 +1757,6 @@ MOBILE_MACHINE_TEMPLATE = """
         </div>
     </div>
 
-    <!-- MODAL MÓVIL: Formulario de Reporte Completo -->
     <div id="modal-reporte-movil" class="fixed inset-0 bg-slate-950/90 z-[60] hidden flex-col justify-end transform transition-transform duration-300 translate-y-full">
         <div class="bg-slate-900 w-full h-[95vh] rounded-t-3xl border-t border-slate-700 flex flex-col shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
             
@@ -1832,22 +1802,16 @@ MOBILE_MACHINE_TEMPLATE = """
                     <textarea id="movil-rec" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Ej: Cambiar filtro el próximo mes..."></textarea>
                 </div>
 
-                <!-- SECCIÓN DE REPUESTOS CON BUSCADOR FLOTANTE -->
                 <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700 relative">
                     <label class="block text-[11px] font-bold text-cyan-400 uppercase mb-2"><i class="fa-solid fa-box-open mr-1"></i> Repuestos Utilizados</label>
                     
                     <div class="flex space-x-2 relative" id="movil-dropdown-container">
                         <div class="flex-1 min-w-0 relative">
-                            <!-- Input de Búsqueda -->
                             <input type="text" id="movil-search-repuesto" autocomplete="off" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none focus:border-cyan-500 placeholder-slate-500" placeholder="Buscar por código o nombre..." onfocus="showDropdown()" onkeyup="filterDropdown()">
-                            
-                            <!-- Valores Ocultos Seleccionados -->
                             <input type="hidden" id="movil-id-repuesto-selected">
                             <input type="hidden" id="movil-nombre-repuesto-selected">
 
-                            <!-- Lista Flotante de Resultados -->
                             <ul id="movil-dropdown-list" class="hidden absolute bottom-full mb-1 left-0 w-full bg-slate-800 border border-slate-600 rounded-lg max-h-48 overflow-y-auto shadow-[0_-10px_30px_rgba(0,0,0,0.6)] z-50 divide-y divide-slate-700">
-                                <!-- Llenado por Javascript -->
                             </ul>
                         </div>
                         <input type="number" id="movil-input-cant" value="1" min="0.1" step="0.1" class="w-16 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white text-center outline-none">
@@ -1865,7 +1829,6 @@ MOBILE_MACHINE_TEMPLATE = """
                     <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1"><i class="fa-solid fa-camera mr-1"></i> Evidencia Fotográfica</label>
                     <input type="file" id="movil-fotos" multiple accept="image/*" class="w-full text-sm text-slate-500 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-cyan-900/50 file:text-cyan-400 bg-slate-950 border border-slate-800 rounded-xl" onchange="previewMobileImages(event)">
                     
-                    <!-- PREVIEW CON BOTÓN DE ELIMINAR (X) -->
                     <div id="movil-preview-container" class="grid grid-cols-2 gap-2 mt-3 hidden"></div>
                 </div>
             </div>
@@ -1881,7 +1844,7 @@ MOBILE_MACHINE_TEMPLATE = """
     <script>
         let evidenciasBase64Movil = [];
         let repuestosUsadosMovil = [];
-        let repuestosDisponibles = []; // Para el buscador en vivo
+        let repuestosDisponibles = [];
 
         function showMobileToast(msg, isError = false) {
             const toast = document.getElementById('mobile-toast');
@@ -1914,12 +1877,10 @@ MOBILE_MACHINE_TEMPLATE = """
             document.getElementById('movil-obs').value = '';
             document.getElementById('movil-rec').value = '';
             
-            // Limpieza de buscador
             document.getElementById('movil-search-repuesto').value = '';
             document.getElementById('movil-id-repuesto-selected').value = '';
             document.getElementById('movil-nombre-repuesto-selected').value = '';
             
-            // Limpieza de Fotos
             document.getElementById('movil-fotos').value = '';
             const previewContainer = document.getElementById('movil-preview-container');
             previewContainer.innerHTML = '';
@@ -1929,7 +1890,6 @@ MOBILE_MACHINE_TEMPLATE = """
             repuestosUsadosMovil = [];
             actualizarListaUI();
 
-            // Fetch de datos para el buscador flotante
             fetch('/api/inventario').then(res => res.json()).then(data => {
                 repuestosDisponibles = data.filter(r => r.cantidad_actual > 0);
                 renderDropdown(repuestosDisponibles);
@@ -1946,7 +1906,6 @@ MOBILE_MACHINE_TEMPLATE = """
             setTimeout(() => modal.classList.add('hidden'), 300);
         }
 
-        // --- LÓGICA DEL BUSCADOR FLOTANTE DE REPUESTOS ---
         function renderDropdown(list) {
             const ul = document.getElementById('movil-dropdown-list');
             ul.innerHTML = '';
@@ -1973,9 +1932,7 @@ MOBILE_MACHINE_TEMPLATE = """
             document.getElementById('movil-dropdown-list').classList.remove('hidden');
         }
 
-        function showDropdown() {
-            document.getElementById('movil-dropdown-list').classList.remove('hidden');
-        }
+        function showDropdown() { document.getElementById('movil-dropdown-list').classList.remove('hidden'); }
 
         function selectRepuesto(id, nombre) {
             document.getElementById('movil-id-repuesto-selected').value = id;
@@ -1984,14 +1941,12 @@ MOBILE_MACHINE_TEMPLATE = """
             document.getElementById('movil-dropdown-list').classList.add('hidden');
         }
 
-        // Cerrar dropdown si toca fuera
         document.addEventListener('click', function(event) {
             const container = document.getElementById('movil-dropdown-container');
             if (container && !container.contains(event.target)) {
                 document.getElementById('movil-dropdown-list')?.classList.add('hidden');
             }
         });
-        // -------------------------------------------------
 
         function agregarRepuestoMovil() {
             const idRep = document.getElementById('movil-id-repuesto-selected').value;
@@ -2006,7 +1961,6 @@ MOBILE_MACHINE_TEMPLATE = """
             repuestosUsadosMovil.push({ id_repuesto: idRep, nombre: nombreRep, cantidad: cant });
             actualizarListaUI();
             
-            // Limpiar inputs
             document.getElementById('movil-search-repuesto').value = '';
             document.getElementById('movil-id-repuesto-selected').value = '';
             document.getElementById('movil-nombre-repuesto-selected').value = '';
@@ -2024,7 +1978,6 @@ MOBILE_MACHINE_TEMPLATE = """
 
         function quitarRepuestoMovil(i) { repuestosUsadosMovil.splice(i, 1); actualizarListaUI(); }
 
-        // --- SISTEMA FOTOGRÁFICO CON ELIMINACIÓN INDIVIDUAL ---
         function previewMobileImages(event) {
             const files = event.target.files;
             
@@ -2032,13 +1985,11 @@ MOBILE_MACHINE_TEMPLATE = """
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const b64 = e.target.result;
-                    // Acumulamos en el array global
                     evidenciasBase64Movil.push(b64.split(',')[1]);
                     renderMobileImages();
                 };
                 reader.readAsDataURL(file);
             });
-            // Reseteamos el input para permitir elegir el mismo archivo si es necesario
             event.target.value = '';
         }
 
@@ -2066,12 +2017,9 @@ MOBILE_MACHINE_TEMPLATE = """
         }
 
         function removeMobileImage(index) {
-            // Eliminamos esa foto específica del array
             evidenciasBase64Movil.splice(index, 1);
-            // Re-renderizamos
             renderMobileImages();
         }
-        // ---------------------------------------------------
 
         function enviarReporteMovil() {
             const idOrden = document.getElementById('movil-id-orden').value;
@@ -2235,9 +2183,7 @@ MONITOR_TEMPLATE = """
                     let pctOrd = 100;
                     if(totOrd > 0) pctOrd = Math.round((compOrd / totOrd) * 100);
                     
-                    const countUp = (id, target) => {
-                        document.getElementById(id).textContent = target + '%';
-                    };
+                    const countUp = (id, target) => { document.getElementById(id).textContent = target + '%'; };
                     countUp('ordenes-porcentaje', pctOrd);
                     document.getElementById('barra-progreso').style.width = `${pctOrd}%`;
 
@@ -2276,12 +2222,7 @@ MONITOR_TEMPLATE = """
                     document.getElementById('badge-detenidos').textContent = detMaq.length;
                     const lista = document.getElementById('lista-detenidos');
                     if(detMaq.length === 0) {
-                        lista.innerHTML = `
-                            <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500">
-                                <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
-                                <p class="font-bold text-lg">Todos los equipos operativos</p>
-                            </div>
-                        `;
+                        lista.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500"><i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i><p class="font-bold text-lg">Todos los equipos operativos</p></div>`;
                     } else {
                         lista.innerHTML = detMaq.map(m => `
                             <div class="bg-slate-950 border-l-4 border-rose-500 rounded-lg p-4 shadow-md flex items-center justify-between transform transition-all duration-300 hover:scale-105">
@@ -2313,6 +2254,7 @@ MONITOR_TEMPLATE = """
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     next_url = request.args.get('next') or request.form.get('next')
+    
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -2327,10 +2269,12 @@ def login():
             session['nombre_completo'] = user['nombre_completo']
             session['rol'] = user['rol']
             
-            if next_url: return redirect(next_url)
+            if next_url:
+                return redirect(next_url)
             return redirect(url_for('dashboard'))
             
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
+    
     return render_template_string(LOGIN_TEMPLATE, error=None, next_url=next_url)
 
 @app.route('/logout')
@@ -2573,13 +2517,8 @@ def api_descargar_reporte(id_orden):
     orden = conn.execute(query, (id_orden,)).fetchone()
     evidencias_db = conn.execute("SELECT imagen_base64 FROM Evidencia_Fotografica WHERE id_mantenimiento = ?", (id_orden,)).fetchall()
     
-    repuestos_db = conn.execute("""
-        SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre 
-        FROM Repuestos_Orden ro 
-        JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto 
-        WHERE ro.id_mantenimiento = ?
-    """, (id_orden,)).fetchall()
-    
+    rep_query = "SELECT ro.cantidad_usada, rs.unidad_medida, rs.nombre FROM Repuestos_Orden ro JOIN Repuestos_Stock rs ON ro.id_repuesto = rs.id_repuesto WHERE ro.id_mantenimiento = ?"
+    repuestos_db = conn.execute(rep_query, (id_orden,)).fetchall()
     conn.close()
 
     if not orden: return "Orden no encontrada", 404
@@ -2597,12 +2536,13 @@ def api_descargar_reporte(id_orden):
     lbl_style = ParagraphStyle(name='Lbl', alignment=0, fontName='Times-Roman', fontSize=10)
     val_style = ParagraphStyle(name='Val', alignment=0, fontName='Times-Roman', fontSize=10)
     fecha_format = orden['fecha_ejecucion']
+    
     try:
         f_obj = datetime.strptime(fecha_format, '%Y-%m-%d')
         fecha_format = f_obj.strftime('%d/%m/%y')
     except: pass
 
-    codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
+    codigo_pdf = orden['codigo_reman'] if orden.get('codigo_reman') else "RE MAN-000"
     
     header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph(codigo_pdf, val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
     t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
@@ -2616,53 +2556,26 @@ def api_descargar_reporte(id_orden):
     elements.append(Paragraph("2. TRABAJO SOLICITADO:", title_style))
     elements.append(Paragraph(f"• Mantenimiento {orden['tipo_mantenimiento'].lower()} reportado: {orden['descripcion_tarea']}", normal_style))
     
-    # FUNCION INTELIGENTE DE VIÑETAS
-    def formatear_texto_multilinea(texto):
-        if not texto: return "• Ninguno."
-        lineas = texto.split('\n')
-        lineas_formateadas = []
-        for linea in lineas:
-            l = linea.strip()
-            if l:
-                if l.startswith('-') or l.startswith('•') or l.startswith('*'):
-                    lineas_formateadas.append(l) 
-                else:
-                    lineas_formateadas.append(f"• {l}")
-        return "<br/>".join(lineas_formateadas)
-
     elements.append(Paragraph("3. OBSERVACIONES:", title_style))
-    elements.append(Paragraph(formatear_texto_multilinea(orden['observaciones']), normal_style))
-
+    obs_formateado = formatear_texto_multilinea(orden['observaciones'])
+    elements.append(Paragraph(obs_formateado, normal_style))
+    
     elements.append(Paragraph("4. TRABAJOS REALIZADOS:", title_style))
-    elements.append(Paragraph(formatear_texto_multilinea(orden['trabajos_realizados']), normal_style))
-
+    trabajos_formateado = formatear_texto_multilinea(orden['trabajos_realizados'])
+    elements.append(Paragraph(trabajos_formateado, normal_style))
+    
     elements.append(Paragraph("RECURSOS NECESARIOS:", title_style))
     
-    rep_strs = []
-    for r in repuestos_db:
-        c_val = r['cantidad_usada']
-        c_str = str(int(c_val)) if c_val.is_integer() else str(c_val)
-        u_str = r['unidad_medida'].strip()
-        if c_val == 1:
-            if u_str.lower() in ['galones', 'galón']: u_str = 'Galón'
-            elif u_str.lower() == 'unidades': u_str = 'Unidad'
-            elif u_str.lower() == 'metros': u_str = 'Metro'
-            elif u_str.lower() == 'litros': u_str = 'Litro'
-            elif u_str.lower() == 'cajas': u_str = 'Caja'
-            elif u_str.lower() == 'pares': u_str = 'Par'
-        else:
-            if u_str.lower() in ['unidad', 'metro', 'litro', 'caja', 'rollo', 'paquete']: u_str += 's'
-            elif u_str.lower() in ['galon', 'galón']: u_str = 'Galones'
-            elif u_str.lower() == 'par': u_str = 'Pares'
-        rep_strs.append(f"• {c_str} {u_str} de {r['nombre']}")
-        
-    rep_text = "<br/>".join(rep_strs) if rep_strs else "<i>No se utilizaron repuestos de almacén.</i>"
+    rep_strs = [formatear_repuesto(r['cantidad_usada'], r['unidad_medida'], r['nombre']) for r in repuestos_db]
+    rep_text = "<br/>".join([f"• {r}" for r in rep_strs]) if rep_strs else "<i>No se utilizaron repuestos de almacén.</i>"
+    
     equipos_text = "<br/>".join([f"• {e.strip()}" for e in orden['equipos_necesarios'].split(',') if e.strip()]) or "• Herramientas manuales estándar"
     recursos_text = f"<b>Mano de obra:</b><br/>• 01 técnico de mantenimiento ({orden['tecnico_asignado']})<br/><br/><b>Equipos necesarios:</b><br/>{equipos_text}<br/><br/><b>Materiales y repuestos:</b><br/>{rep_text}"
     elements.append(Paragraph(recursos_text, normal_style))
     
     elements.append(Paragraph("5. COMENTARIOS / RECOMENDACIONES:", title_style))
-    elements.append(Paragraph(formatear_texto_multilinea(orden['recomendaciones']), normal_style))
+    rec_formateado = formatear_texto_multilinea(orden['recomendaciones'])
+    elements.append(Paragraph(rec_formateado, normal_style))
     
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     if evidencias_db:
