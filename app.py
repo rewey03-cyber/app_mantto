@@ -59,19 +59,12 @@ GITHUB_SECRET = 'cafetec_github_2026_seguro'
 
 @app.before_request
 def requerir_login():
-    """Protege todas las rutas del sistema, excepto el login, QR estático, API móvil y Webhook."""
-    rutas_permitidas = [
-        'login', 
-        'static', 
-        'api_etiqueta_qr', 
-        'vista_movil_maquina', 
-        'webhook_update',
-        'api_inventario',        # Para cargar el select de repuestos en el móvil
-        'api_completar_orden'    # Para guardar el reporte móvil
-    ]
+    """Protege todas las rutas del sistema, excepto el login, QR estático y Webhook."""
+    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update']
     
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
         # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR) para redirigirlo tras el login
+        # Evitamos guardar rutas API ocultas para no causar ciclos infinitos
         next_url = request.url if request.endpoint == 'vista_movil_maquina' else None
         return redirect(url_for('login', next=next_url))
 
@@ -112,17 +105,18 @@ def migrar_base_datos():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM Usuarios")
     if cursor.fetchone()[0] == 0:
-        usuarios_defecto = [('admin', generate_password_hash('Cafetec_Admin2026*'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('Cafe_Tecnico2026*'), 'Juan Pérez', 'Tecnico')]
+        usuarios_defecto = [('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('tec123'), 'Gian Marco Ureta C.', 'Tecnico')]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
+    
+    # ATENCIÓN: Removido el UNIQUE de codigo_reman para evitar bloqueos en SQLite al actualizar tablas existentes.
     conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
+    
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
-    # IMPORTANTE: No usamos UNIQUE en ALTER TABLE para no romper SQLite si ya hay datos
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT")
     except sqlite3.OperationalError: pass 
-    
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN recomendaciones TEXT DEFAULT 'Ninguna.'")
@@ -133,7 +127,6 @@ def migrar_base_datos():
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN tiempo_ejecucion TEXT DEFAULT '0 h'")
     except sqlite3.OperationalError: pass 
-    
     try: conn.execute("""CREATE TABLE IF NOT EXISTS Evidencia_Fotografica (id_evidencia INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, imagen_base64 TEXT NOT NULL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE)""")
     except sqlite3.OperationalError: pass
     try: conn.execute("""CREATE TABLE IF NOT EXISTS Compras_Repuestos (id_compra INTEGER PRIMARY KEY AUTOINCREMENT, id_repuesto INTEGER NOT NULL, cantidad REAL NOT NULL, costo_unitario REAL NOT NULL, proveedor TEXT, factura TEXT, fecha_compra TEXT DEFAULT (date('now', 'localtime')), FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto) ON DELETE CASCADE)""")
@@ -141,7 +134,7 @@ def migrar_base_datos():
     conn.commit()
     conn.close()
 
-# Ejecutamos la migración de la Base de Datos a nivel global para que PythonAnywhere lo lea de inmediato
+# Forzamos la ejecución al cargar el archivo para asegurar que la BD está íntegra (Resuelve el error 500)
 migrar_base_datos()
 
 def obtener_todas_las_maquinas():
@@ -324,7 +317,6 @@ LOGIN_TEMPLATE = """
         
         <form method="POST" action="/login" class="space-y-6">
             {% if next_url %}
-            <!-- Redirección Inteligente tras login -->
             <input type="hidden" name="next" value="{{ next_url }}">
             {% endif %}
             <div>
@@ -432,13 +424,10 @@ HTML_TEMPLATE = """
                             <span class="font-bold text-white text-[11px]">{{ session.get('nombre_completo', 'Usuario') }}</span>
                             <span class="text-[9px] text-cyan-400 uppercase tracking-widest font-bold">{{ session.get('rol', 'Técnico') }}</span>
                         </div>
-                        
-                        <!-- CASCO PARA EL TÉCNICO, ASTRONAUTA PARA ADMIN -->
                         <div class="w-8 h-8 rounded-full flex justify-center items-center mr-3 shadow-md 
-                            {% if session.get('rol') == 'Tecnico' %} bg-[#004b87] border border-cyan-500 {% else %} bg-cyan-600 border border-cyan-400 {% endif %}">
-                            <i class="fa-solid {% if session.get('rol') == 'Tecnico' %} fa-helmet-safety {% else %} fa-user-astronaut {% endif %} text-white {% if session.get('rol') == 'Tecnico' %}text-xs{% endif %}"></i>
+                            {% if session.get('rol') == 'Tecnico' %} bg-cyan-700 border border-cyan-500 {% else %} bg-cyan-600 border border-cyan-400 {% endif %}">
+                            <i class="fa-solid {% if session.get('rol') == 'Tecnico' %} fa-helmet-safety text-xs {% else %} fa-user-astronaut {% endif %} text-white"></i>
                         </div>
-                        
                         <div class="h-6 w-px bg-slate-700 mr-2"></div>
                         <a href="/logout" class="w-8 h-8 rounded-full bg-rose-600/20 text-rose-500 hover:bg-rose-500 hover:text-white flex justify-center items-center transition-colors" title="Cerrar Sesión">
                             <i class="fa-solid fa-right-from-bracket"></i>
@@ -453,7 +442,6 @@ HTML_TEMPLATE = """
         
         <!-- Panel Gerencial a ocultar para Técnicos -->
         <div id="panel-gerencial">
-            <!-- Tarjetas de Resumen (KPIs) -->
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
                 <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
                     <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
@@ -495,7 +483,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Gráficos de Estado (Chart.js) -->
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
                 <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
                     <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
@@ -787,9 +774,17 @@ HTML_TEMPLATE = """
 
                 <div class="mb-4 bg-slate-800/50 p-4 rounded-lg border border-slate-700">
                     <label class="block text-xs font-bold text-cyan-400 uppercase mb-2"><i class="fa-solid fa-box-open mr-1"></i> Repuestos Utilizados</label>
-                    <div class="flex space-x-2">
-                        <select id="select-uso-repuesto" class="flex-1 min-w-0 flex-shrink-0 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white truncate"></select>
-                        <input type="number" id="input-uso-cant" value="1" min="0.1" step="0.1" class="w-20 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white" placeholder="Cant.">
+                    <div class="flex space-x-2 relative" id="escritorio-dropdown-container">
+                        <div class="flex-1 min-w-0 relative">
+                            <input type="text" id="escritorio-search-repuesto" autocomplete="off" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none focus:border-cyan-500 placeholder-slate-500" placeholder="Buscar por código o nombre..." onfocus="showDesktopDropdown()" onkeyup="filterDesktopDropdown()">
+                            <input type="hidden" id="escritorio-id-repuesto-selected">
+                            <input type="hidden" id="escritorio-nombre-repuesto-selected">
+
+                            <ul id="escritorio-dropdown-list" class="hidden absolute bottom-full mb-1 left-0 w-full bg-slate-800 border border-slate-600 rounded-lg max-h-48 overflow-y-auto shadow-[0_-10px_30px_rgba(0,0,0,0.6)] z-50 divide-y divide-slate-700">
+                                <!-- JS fills this -->
+                            </ul>
+                        </div>
+                        <input type="number" id="input-uso-cant" value="1" min="0.1" step="0.1" class="w-20 border border-slate-700 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white text-center" placeholder="Cant.">
                         <button type="button" onclick="agregarRepuestoALista()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 rounded-lg font-bold transition-colors">
                             <i class="fa-solid fa-plus"></i>
                         </button>
@@ -975,17 +970,15 @@ HTML_TEMPLATE = """
 
         let chartMaquinas = null;
         let chartOrdenes = null;
+        let repuestosDisponiblesDesktop = [];
 
-        // --- LÓGICA DE UX POR ROLES ---
+        // Autorización en Interfaz (Ocultar botones si es Técnico)
         if (CURRENT_ROLE === 'Tecnico') {
             document.getElementById('btn-add-maquina')?.classList.add('hidden');
             document.getElementById('btn-historial-compras')?.classList.add('hidden');
             document.getElementById('btn-add-orden')?.classList.add('hidden');
-            
-            // Ocultar todo el panel gerencial (Tarjetas y Gráficos)
             document.getElementById('panel-gerencial')?.classList.add('hidden');
             
-            // Cambiar el título de la tabla de órdenes
             const tituloOrdenes = document.getElementById('titulo-tabla-ordenes');
             if(tituloOrdenes) {
                 tituloOrdenes.innerHTML = '<i class="fa-solid fa-clipboard-list text-cyan-500 mr-2"></i> Mis Tareas Pendientes';
@@ -1090,7 +1083,7 @@ HTML_TEMPLATE = """
                                 <button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>
                             `;
                         }
-
+                        
                         let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
 
                         html += `
@@ -1396,27 +1389,76 @@ HTML_TEMPLATE = """
             evidenciasBase64 = [];
             actualizarListaUI();
             
+            // Lógica Dropdown Escritorio
+            document.getElementById('escritorio-search-repuesto').value = '';
+            document.getElementById('escritorio-id-repuesto-selected').value = '';
+            document.getElementById('escritorio-nombre-repuesto-selected').value = '';
+            document.getElementById('input-uso-cant').value = '1';
+            
             fetch('/api/inventario').then(res => res.json()).then(data => {
-                const select = document.getElementById('select-uso-repuesto');
-                select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
-                data.forEach(r => {
-                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} - ${r.nombre} (Stock: ${r.cantidad_actual})</option>`;
-                });
+                repuestosDisponiblesDesktop = data.filter(r => r.cantidad_actual > 0);
+                renderDesktopDropdown(repuestosDisponiblesDesktop);
             });
             modalCompletar.classList.remove('hidden');
         }
 
         function cerrarModalCompletar() { modalCompletar.classList.add('hidden'); }
+        
+        // --- DROPDOWN INTELIGENTE ESCRITORIO ---
+        function renderDesktopDropdown(list) {
+            const ul = document.getElementById('escritorio-dropdown-list');
+            ul.innerHTML = '';
+            if(list.length === 0) {
+                ul.innerHTML = '<li class="p-3 text-sm text-slate-500 italic text-center">No se encontraron repuestos.</li>';
+                return;
+            }
+            list.forEach(r => {
+                const li = document.createElement('li');
+                li.className = 'p-3 hover:bg-slate-700 cursor-pointer text-xs text-white transition-colors';
+                li.innerHTML = `<span class="font-bold text-cyan-400">${r.codigo_pieza}</span> - ${r.nombre} <br><span class="text-slate-400 text-[10px]">Stock Disponible: ${r.cantidad_actual} ${r.unidad_medida}</span>`;
+                li.onclick = () => selectDesktopRepuesto(r.id_repuesto, `${r.codigo_pieza} - ${r.nombre}`);
+                ul.appendChild(li);
+            });
+        }
+
+        function filterDesktopDropdown() {
+            const term = document.getElementById('escritorio-search-repuesto').value.toLowerCase();
+            const filtered = repuestosDisponiblesDesktop.filter(r => 
+                r.codigo_pieza.toLowerCase().includes(term) || 
+                r.nombre.toLowerCase().includes(term)
+            );
+            renderDesktopDropdown(filtered);
+            document.getElementById('escritorio-dropdown-list').classList.remove('hidden');
+        }
+
+        function showDesktopDropdown() {
+            document.getElementById('escritorio-dropdown-list').classList.remove('hidden');
+        }
+
+        function selectDesktopRepuesto(id, nombre) {
+            document.getElementById('escritorio-id-repuesto-selected').value = id;
+            document.getElementById('escritorio-nombre-repuesto-selected').value = nombre;
+            document.getElementById('escritorio-search-repuesto').value = nombre;
+            document.getElementById('escritorio-dropdown-list').classList.add('hidden');
+        }
 
         function agregarRepuestoALista() {
-            const select = document.getElementById('select-uso-repuesto');
+            const idRep = document.getElementById('escritorio-id-repuesto-selected').value;
+            const nombreRep = document.getElementById('escritorio-nombre-repuesto-selected').value;
             const cant = document.getElementById('input-uso-cant').value;
-            if(!select.value || cant <= 0) { 
-                mostrarNotificacion("Selecciona un repuesto y cantidad válida.", 'error'); 
+
+            if(!idRep || cant <= 0) { 
+                mostrarNotificacion("Busca un repuesto y define una cantidad válida.", 'error'); 
                 return; 
             }
-            repuestosUsadosTemp.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
+            repuestosUsadosTemp.push({ id_repuesto: idRep, nombre: nombreRep, cantidad: cant });
             actualizarListaUI();
+            
+            // Limpiar campos
+            document.getElementById('escritorio-search-repuesto').value = '';
+            document.getElementById('escritorio-id-repuesto-selected').value = '';
+            document.getElementById('escritorio-nombre-repuesto-selected').value = '';
+            document.getElementById('input-uso-cant').value = '1';
         }
 
         function actualizarListaUI() {
@@ -1432,24 +1474,38 @@ HTML_TEMPLATE = """
 
         function procesarImagenes(event) {
             const files = event.target.files;
-            const previewContainer = document.getElementById('preview-fotos');
-            previewContainer.innerHTML = '';
-            evidenciasBase64 = [];
-
             Array.from(files).forEach(file => {
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const b64 = e.target.result;
                     const base64Data = b64.split(',')[1];
                     evidenciasBase64.push(base64Data);
-
-                    const img = document.createElement('img');
-                    img.src = b64;
-                    img.className = 'w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm';
-                    previewContainer.appendChild(img);
+                    renderDesktopImages();
                 };
                 reader.readAsDataURL(file);
             });
+            event.target.value = ''; // Resetea el input para permitir subir la misma foto si se equivocó
+        }
+        
+        function renderDesktopImages() {
+            const container = document.getElementById('preview-fotos');
+            container.innerHTML = '';
+            evidenciasBase64.forEach((b64, index) => {
+                const div = document.createElement('div');
+                div.className = 'relative group';
+                div.innerHTML = `
+                    <img src="data:image/jpeg;base64,${b64}" class="w-full h-24 object-cover rounded-lg border border-slate-700 shadow-sm">
+                    <button type="button" onclick="removeDesktopImage(${index})" class="absolute top-1 right-1 bg-rose-600 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg hover:bg-rose-500 transition-colors">
+                        <i class="fa-solid fa-xmark text-xs"></i>
+                    </button>
+                `;
+                container.appendChild(div);
+            });
+        }
+        
+        function removeDesktopImage(index) {
+            evidenciasBase64.splice(index, 1);
+            renderDesktopImages();
         }
 
         function confirmarCompletarOrden() {
@@ -1534,6 +1590,12 @@ HTML_TEMPLATE = """
             const btnAlertas = document.getElementById('btn-alertas-flotante');
             if (panelAlertas && !panelAlertas.classList.contains('hidden') && !panelAlertas.contains(e.target) && e.target !== btnAlertas && !btnAlertas.contains(e.target)) {
                 cerrarModalAlertas();
+            }
+            
+            // Cerrar Dropdowns al hacer click afuera
+            const dropDesktop = document.getElementById('escritorio-dropdown-container');
+            if (dropDesktop && !dropDesktop.contains(e.target)) {
+                document.getElementById('escritorio-dropdown-list')?.classList.add('hidden');
             }
         });
 
@@ -1726,15 +1788,30 @@ MOBILE_MACHINE_TEMPLATE = """
                     <textarea id="movil-rec" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm text-white focus:border-cyan-500 outline-none" placeholder="Ej: Cambiar filtro el próximo mes..."></textarea>
                 </div>
 
-                <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700">
+                <!-- SECCIÓN DE REPUESTOS CON BUSCADOR FLOTANTE -->
+                <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700 relative">
                     <label class="block text-[11px] font-bold text-cyan-400 uppercase mb-2"><i class="fa-solid fa-box-open mr-1"></i> Repuestos Utilizados</label>
-                    <div class="flex space-x-2">
-                        <select id="movil-select-repuesto" class="flex-1 min-w-0 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none truncate"></select>
+                    
+                    <div class="flex space-x-2 relative" id="movil-dropdown-container">
+                        <div class="flex-1 min-w-0 relative">
+                            <!-- Input de Búsqueda -->
+                            <input type="text" id="movil-search-repuesto" autocomplete="off" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white outline-none focus:border-cyan-500 placeholder-slate-500" placeholder="Buscar por código o nombre..." onfocus="showDropdown()" onkeyup="filterDropdown()">
+                            
+                            <!-- Valores Ocultos Seleccionados -->
+                            <input type="hidden" id="movil-id-repuesto-selected">
+                            <input type="hidden" id="movil-nombre-repuesto-selected">
+
+                            <!-- Lista Flotante de Resultados -->
+                            <ul id="movil-dropdown-list" class="hidden absolute bottom-full mb-1 left-0 w-full bg-slate-800 border border-slate-600 rounded-lg max-h-48 overflow-y-auto shadow-[0_-10px_30px_rgba(0,0,0,0.6)] z-50 divide-y divide-slate-700">
+                                <!-- Llenado por Javascript -->
+                            </ul>
+                        </div>
                         <input type="number" id="movil-input-cant" value="1" min="0.1" step="0.1" class="w-16 bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white text-center outline-none">
-                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold">
+                        <button type="button" onclick="agregarRepuestoMovil()" class="bg-cyan-600 text-white px-3 rounded-lg font-bold shadow-md active:bg-cyan-500">
                             <i class="fa-solid fa-plus"></i>
                         </button>
                     </div>
+                    
                     <ul id="movil-lista-repuestos" class="mt-3 divide-y divide-slate-700/50 max-h-32 overflow-y-auto">
                         <li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>
                     </ul>
@@ -1743,6 +1820,8 @@ MOBILE_MACHINE_TEMPLATE = """
                 <div>
                     <label class="block text-[11px] font-bold text-slate-500 uppercase mb-1"><i class="fa-solid fa-camera mr-1"></i> Evidencia Fotográfica</label>
                     <input type="file" id="movil-fotos" multiple accept="image/*" class="w-full text-sm text-slate-500 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-bold file:bg-cyan-900/50 file:text-cyan-400 bg-slate-950 border border-slate-800 rounded-xl" onchange="previewMobileImages(event)">
+                    
+                    <!-- PREVIEW CON BOTÓN DE ELIMINAR (X) -->
                     <div id="movil-preview-container" class="grid grid-cols-2 gap-2 mt-3 hidden"></div>
                 </div>
             </div>
@@ -1758,6 +1837,7 @@ MOBILE_MACHINE_TEMPLATE = """
     <script>
         let evidenciasBase64Movil = [];
         let repuestosUsadosMovil = [];
+        let repuestosDisponibles = []; // Para el buscador en vivo
 
         function showMobileToast(msg, isError = false) {
             const toast = document.getElementById('mobile-toast');
@@ -1789,8 +1869,14 @@ MOBILE_MACHINE_TEMPLATE = """
             document.getElementById('movil-equipos').value = '';
             document.getElementById('movil-obs').value = '';
             document.getElementById('movil-rec').value = '';
-            document.getElementById('movil-fotos').value = '';
             
+            // Limpieza de buscador
+            document.getElementById('movil-search-repuesto').value = '';
+            document.getElementById('movil-id-repuesto-selected').value = '';
+            document.getElementById('movil-nombre-repuesto-selected').value = '';
+            
+            // Limpieza de Fotos
+            document.getElementById('movil-fotos').value = '';
             const previewContainer = document.getElementById('movil-preview-container');
             previewContainer.innerHTML = '';
             previewContainer.classList.add('hidden');
@@ -1799,12 +1885,10 @@ MOBILE_MACHINE_TEMPLATE = """
             repuestosUsadosMovil = [];
             actualizarListaUI();
 
+            // Fetch de datos para el buscador flotante
             fetch('/api/inventario').then(res => res.json()).then(data => {
-                const select = document.getElementById('movil-select-repuesto');
-                select.innerHTML = '<option value="" disabled selected>Selecciona un repuesto...</option>';
-                data.forEach(r => {
-                    if(r.cantidad_actual > 0) select.innerHTML += `<option value="${r.id_repuesto}" data-nombre="${r.codigo_pieza} - ${r.nombre}">${r.codigo_pieza} (Stock: ${r.cantidad_actual})</option>`;
-                });
+                repuestosDisponibles = data.filter(r => r.cantidad_actual > 0);
+                renderDropdown(repuestosDisponibles);
             }).catch(err => console.error("Error al cargar repuestos: ", err));
 
             const modal = document.getElementById('modal-reporte-movil');
@@ -1818,15 +1902,71 @@ MOBILE_MACHINE_TEMPLATE = """
             setTimeout(() => modal.classList.add('hidden'), 300);
         }
 
+        // --- LÓGICA DEL BUSCADOR FLOTANTE DE REPUESTOS ---
+        function renderDropdown(list) {
+            const ul = document.getElementById('movil-dropdown-list');
+            ul.innerHTML = '';
+            if(list.length === 0) {
+                ul.innerHTML = '<li class="p-3 text-sm text-slate-500 italic text-center">No se encontraron repuestos.</li>';
+                return;
+            }
+            list.forEach(r => {
+                const li = document.createElement('li');
+                li.className = 'p-3 hover:bg-slate-700 cursor-pointer text-xs text-white transition-colors';
+                li.innerHTML = `<span class="font-bold text-cyan-400">${r.codigo_pieza}</span> - ${r.nombre} <br><span class="text-slate-400 text-[10px]">Stock Disponible: ${r.cantidad_actual} ${r.unidad_medida}</span>`;
+                li.onclick = () => selectRepuesto(r.id_repuesto, `${r.codigo_pieza} - ${r.nombre}`);
+                ul.appendChild(li);
+            });
+        }
+
+        function filterDropdown() {
+            const term = document.getElementById('movil-search-repuesto').value.toLowerCase();
+            const filtered = repuestosDisponibles.filter(r => 
+                r.codigo_pieza.toLowerCase().includes(term) || 
+                r.nombre.toLowerCase().includes(term)
+            );
+            renderDropdown(filtered);
+            document.getElementById('movil-dropdown-list').classList.remove('hidden');
+        }
+
+        function showDropdown() {
+            document.getElementById('movil-dropdown-list').classList.remove('hidden');
+        }
+
+        function selectRepuesto(id, nombre) {
+            document.getElementById('movil-id-repuesto-selected').value = id;
+            document.getElementById('movil-nombre-repuesto-selected').value = nombre;
+            document.getElementById('movil-search-repuesto').value = nombre;
+            document.getElementById('movil-dropdown-list').classList.add('hidden');
+        }
+
+        // Cerrar dropdown si toca fuera
+        document.addEventListener('click', function(event) {
+            const container = document.getElementById('movil-dropdown-container');
+            if (container && !container.contains(event.target)) {
+                document.getElementById('movil-dropdown-list')?.classList.add('hidden');
+            }
+        });
+        // -------------------------------------------------
+
         function agregarRepuestoMovil() {
-            const select = document.getElementById('movil-select-repuesto');
+            const idRep = document.getElementById('movil-id-repuesto-selected').value;
+            const nombreRep = document.getElementById('movil-nombre-repuesto-selected').value;
             const cant = document.getElementById('movil-input-cant').value;
-            if(!select.value || cant <= 0) { 
-                showMobileToast("Selecciona repuesto y cantidad.", true); 
+
+            if(!idRep || cant <= 0) { 
+                showMobileToast("Busca, selecciona un repuesto y define la cantidad.", true); 
                 return; 
             }
-            repuestosUsadosMovil.push({ id_repuesto: select.value, nombre: select.options[select.selectedIndex].getAttribute('data-nombre'), cantidad: cant });
+            
+            repuestosUsadosMovil.push({ id_repuesto: idRep, nombre: nombreRep, cantidad: cant });
             actualizarListaUI();
+            
+            // Limpiar inputs
+            document.getElementById('movil-search-repuesto').value = '';
+            document.getElementById('movil-id-repuesto-selected').value = '';
+            document.getElementById('movil-nombre-repuesto-selected').value = '';
+            document.getElementById('movil-input-cant').value = '1';
         }
 
         function actualizarListaUI() {
@@ -1834,35 +1974,60 @@ MOBILE_MACHINE_TEMPLATE = """
             if(repuestosUsadosMovil.length === 0) { ul.innerHTML = '<li class="py-2 text-xs text-slate-500 italic text-center">No se han agregado repuestos.</li>'; return; }
             ul.innerHTML = '';
             repuestosUsadosMovil.forEach((item, index) => {
-                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded"><i class="fa-solid fa-xmark"></i></button></li>`;
+                ul.innerHTML += `<li class="py-2 flex justify-between items-center text-xs text-slate-300"><span><span class="text-cyan-400 font-bold">${item.cantidad}x</span> ${item.nombre}</span><button type="button" onclick="quitarRepuestoMovil(${index})" class="text-rose-500 w-6 h-6 bg-slate-900 rounded flex justify-center items-center active:bg-slate-800"><i class="fa-solid fa-xmark"></i></button></li>`;
             });
         }
 
         function quitarRepuestoMovil(i) { repuestosUsadosMovil.splice(i, 1); actualizarListaUI(); }
 
+        // --- SISTEMA FOTOGRÁFICO CON ELIMINACIÓN INDIVIDUAL ---
         function previewMobileImages(event) {
             const files = event.target.files;
-            const previewContainer = document.getElementById('movil-preview-container');
-            previewContainer.innerHTML = '';
-            evidenciasBase64Movil = [];
-
-            if(files.length > 0) previewContainer.classList.remove('hidden');
-            else previewContainer.classList.add('hidden');
-
+            
             Array.from(files).forEach(file => {
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const b64 = e.target.result;
+                    // Acumulamos en el array global
                     evidenciasBase64Movil.push(b64.split(',')[1]);
-                    
-                    const img = document.createElement('img');
-                    img.src = b64;
-                    img.className = 'w-full h-24 object-cover rounded-xl border border-slate-700';
-                    previewContainer.appendChild(img);
+                    renderMobileImages();
                 };
                 reader.readAsDataURL(file);
             });
+            // Reseteamos el input para permitir elegir el mismo archivo si es necesario
+            event.target.value = '';
         }
+
+        function renderMobileImages() {
+            const container = document.getElementById('movil-preview-container');
+            container.innerHTML = '';
+            
+            if (evidenciasBase64Movil.length > 0) {
+                container.classList.remove('hidden');
+            } else {
+                container.classList.add('hidden');
+            }
+
+            evidenciasBase64Movil.forEach((b64, index) => {
+                const div = document.createElement('div');
+                div.className = 'relative group';
+                div.innerHTML = `
+                    <img src="data:image/jpeg;base64,${b64}" class="w-full h-24 object-cover rounded-xl border border-slate-700 shadow-sm">
+                    <button type="button" onclick="removeMobileImage(${index})" class="absolute top-1 right-1 bg-rose-600/90 backdrop-blur text-white w-7 h-7 rounded-full flex items-center justify-center shadow-lg active:bg-rose-500 transition-colors">
+                        <i class="fa-solid fa-xmark text-sm"></i>
+                    </button>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        function removeMobileImage(index) {
+            // Eliminamos esa foto específica del array
+            evidenciasBase64Movil.splice(index, 1);
+            // Re-renderizamos
+            renderMobileImages();
+        }
+        // ---------------------------------------------------
 
         function enviarReporteMovil() {
             const idOrden = document.getElementById('movil-id-orden').value;
@@ -1925,6 +2090,7 @@ MONITOR_TEMPLATE = """
     </style>
 </head>
 <body class="flex flex-col h-screen p-4 gap-4">
+    <!-- HEADER -->
     <header class="flex justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-2xl shrink-0">
         <div class="flex items-center">
             <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]">
@@ -1941,7 +2107,9 @@ MONITOR_TEMPLATE = """
         </div>
     </header>
 
+    <!-- MAIN CONTENT -->
     <main class="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
+        <!-- COL 1: KPIs Principales -->
         <div class="flex flex-col gap-4 min-h-0">
             <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center items-center text-center relative overflow-hidden">
                 <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div>
@@ -1968,6 +2136,7 @@ MONITOR_TEMPLATE = """
             </div>
         </div>
 
+        <!-- COL 2: Gráfico de Disponibilidad -->
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col items-center relative overflow-hidden min-h-0">
             <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0">
@@ -1988,6 +2157,7 @@ MONITOR_TEMPLATE = """
             </div>
         </div>
 
+        <!-- COL 3: Equipos Intervenidos -->
         <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col relative overflow-hidden min-h-0">
             <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div>
             <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0">
@@ -1995,6 +2165,7 @@ MONITOR_TEMPLATE = """
                 <span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span>
             </h2>
             <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos">
+                <!-- Se inyecta por JS -->
                 <div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50">
                     <i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i>
                     <p class="font-bold text-lg">Todos los equipos operativos</p>
@@ -2004,6 +2175,7 @@ MONITOR_TEMPLATE = """
     </main>
 
     <script>
+        // Reloj
         function actualizarReloj() {
             const ahora = new Date();
             document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false });
@@ -2103,7 +2275,9 @@ MONITOR_TEMPLATE = """
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    # Detectamos a dónde quería ir el usuario antes de pedirle login
     next_url = request.args.get('next') or request.form.get('next')
+    
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -2118,7 +2292,9 @@ def login():
             session['nombre_completo'] = user['nombre_completo']
             session['rol'] = user['rol']
             
-            if next_url: return redirect(next_url)
+            # REDIRECCIÓN INTELIGENTE: Si escaneó el QR, lo mandamos a la máquina, si no, al Dashboard.
+            if next_url:
+                return redirect(next_url)
             return redirect(url_for('dashboard'))
             
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
