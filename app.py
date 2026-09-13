@@ -113,7 +113,7 @@ def migrar_base_datos():
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
     
     # Tabla de mantenimiento con columna codigo_reman
-    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT UNIQUE, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
     # Alteraciones seguras para tablas ya existentes
@@ -135,6 +135,9 @@ def migrar_base_datos():
     except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
+
+# CRÍTICO: Ejecutar migración al leer el archivo (soluciona el bug de PythonAnywhere)
+migrar_base_datos()
 
 def obtener_todas_las_maquinas():
     conn = get_db_connection()
@@ -314,6 +317,7 @@ LOGIN_TEMPLATE = """
         
         <form method="POST" action="/login" class="space-y-6">
             {% if next_url %}
+            <!-- Campo oculto para la redirección inteligente -->
             <input type="hidden" name="next" value="{{ next_url }}">
             {% endif %}
             <div>
@@ -369,12 +373,15 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Inter', sans-serif; }
         .fuente-logo { font-family: 'Rajdhani', sans-serif; }
+        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; border-radius: 4px; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
         ::-webkit-scrollbar-thumb:hover { background: #22d3ee; }
+        
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
+        
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
     </style>
@@ -998,7 +1005,7 @@ HTML_TEMPLATE = """
             const isDark = document.documentElement.classList.contains('dark'); const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
             const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
             chartOrdenes = new Chart(ctxOrdenes, { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
-        });
+        }).catch(e => console.log(e));
 
         fetch('/api/inventario').then(response => response.json()).then(data => {
             let html = ''; let htmlAlertas = ''; let itemsCriticos = 0;
@@ -1068,7 +1075,8 @@ HTML_TEMPLATE = """
         function guardarOrden(e) { 
             e.preventDefault(); 
             const id_orden = document.getElementById('orden-id').value;
-            const payload = { id_maquina: document.getElementById('select-maquina').value, tipo_mantenimiento: document.getElementById('select-tipo').value, descripcion: document.getElementById('input-descripcion').value, fecha: document.getElementById('input-fecha').value, tecnico: document.getElementById('input-tecnico').value, codigo_reman_manual: document.getElementById('input-reman-manual') ? document.getElementById('input-reman-manual').value : '' };
+            const inputManual = document.getElementById('input-reman-manual');
+            const payload = { id_maquina: document.getElementById('select-maquina').value, tipo_mantenimiento: document.getElementById('select-tipo').value, descripcion: document.getElementById('input-descripcion').value, fecha: document.getElementById('input-fecha').value, tecnico: document.getElementById('input-tecnico').value, codigo_reman_manual: inputManual ? inputManual.value : '' };
             const endpoint = id_orden ? `/api/ordenes/editar/${id_orden}` : '/api/ordenes/nueva';
             fetch(endpoint, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(r=>r.json()).then(res=>{ if(res.status==='ok') window.location.reload(); }); 
         }
@@ -1180,8 +1188,8 @@ MOBILE_MACHINE_TEMPLATE = """
 
         <div>
             <div class="flex justify-between items-center mb-3 ml-1">
-                <h2 class="text-slate-400 font-bold uppercase tracking-widest text-xs flex items-center">
-                    <i class="fa-solid fa-clipboard-list mr-2 text-cyan-500"></i> Tareas Pendientes
+                <h2 class="text-cyan-400 font-bold uppercase tracking-widest text-xs flex items-center">
+                    <i class="fa-solid fa-clipboard-list mr-2"></i> Tareas Pendientes
                 </h2>
                 <span class="bg-slate-800 text-slate-300 text-[10px] font-bold px-2 py-1 rounded-lg">{{ ordenes|length }}</span>
             </div>
@@ -1605,7 +1613,6 @@ def api_registrar_compra(id_repuesto):
 def api_nueva_orden():
     if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
     d = request.json
-    # Se envía el código manual (si el admin lo llenó en el input)
     crear_nueva_orden_db(d['id_maquina'], d['tipo_mantenimiento'], d['descripcion'], d['fecha'], d['tecnico'], d.get('codigo_reman_manual', ''))
     return jsonify({"status": "ok"})
 
@@ -1795,5 +1802,4 @@ if __name__ == '__main__':
     print("=====================================================")
     print("⚙️  INICIANDO CAFETEC CMMS - ÁREA DE MANTENIMIENTO")
     print("=====================================================")
-    migrar_base_datos()
     app.run(host='0.0.0.0', debug=False, port=5000)
