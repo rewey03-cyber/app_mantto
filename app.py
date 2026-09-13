@@ -59,12 +59,13 @@ GITHUB_SECRET = 'cafetec_github_2026_seguro'
 
 @app.before_request
 def requerir_login():
-    """Protege todas las rutas del sistema, excepto el login, QR estático y Webhook."""
-    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update']
+    """Protege todas las rutas del sistema y habilita APIs críticas para la vista móvil."""
+    # NOTA: api_inventario y api_completar_orden están permitidas aquí para que el móvil 
+    # conectado mediante redirección pueda utilizarlas sin ser bloqueado.
+    rutas_permitidas = ['login', 'static', 'api_etiqueta_qr', 'webhook_update', 'vista_movil_maquina', 'api_inventario', 'api_completar_orden']
     
     if request.endpoint not in rutas_permitidas and 'user_id' not in session:
         # MÉTODO PROFESIONAL: Guardar a dónde quería ir (ej. escanear QR) para redirigirlo tras el login
-        # Evitamos guardar rutas API ocultas para no causar ciclos infinitos
         next_url = request.url if request.endpoint == 'vista_movil_maquina' else None
         return redirect(url_for('login', next=next_url))
 
@@ -105,17 +106,18 @@ def migrar_base_datos():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM Usuarios")
     if cursor.fetchone()[0] == 0:
-        usuarios_defecto = [('admin', generate_password_hash('admin123'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('tec123'), 'Juan Pérez', 'Tecnico')]
+        usuarios_defecto = [('admin', generate_password_hash('Cafetec_Admin2026*'), 'Administrador Principal', 'Admin'), ('tecnico1', generate_password_hash('Cafe_Tecnico2026*'), 'Juan Pérez', 'Tecnico')]
         conn.executemany("INSERT INTO Usuarios (username, password_hash, nombre_completo, rol) VALUES (?, ?, ?, ?)", usuarios_defecto)
     
     conn.execute('''CREATE TABLE IF NOT EXISTS Maquinas (id_maquina INTEGER PRIMARY KEY AUTOINCREMENT, codigo_equipo TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, area_planta TEXT NOT NULL, criticidad TEXT NOT NULL, estado TEXT DEFAULT 'Operativa', fecha_instalacion TEXT DEFAULT (date('now', 'localtime')))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Stock (id_repuesto INTEGER PRIMARY KEY AUTOINCREMENT, codigo_pieza TEXT UNIQUE NOT NULL, nombre TEXT NOT NULL, descripcion TEXT, ubicacion_almacen TEXT, cantidad_actual REAL DEFAULT 0, punto_reorden REAL DEFAULT 0, unidad_medida TEXT DEFAULT 'Unidad')''')
     
+    # Tabla de mantenimiento con columna codigo_reman
     conn.execute('''CREATE TABLE IF NOT EXISTS Calendario_Mantenimiento (id_mantenimiento INTEGER PRIMARY KEY AUTOINCREMENT, codigo_reman TEXT UNIQUE, id_maquina INTEGER NOT NULL, tipo_mantenimiento TEXT NOT NULL, descripcion_tarea TEXT NOT NULL, fecha_programada TEXT NOT NULL, fecha_ejecucion TEXT, estado_orden TEXT DEFAULT 'Pendiente', tecnico_asignado TEXT, observaciones TEXT DEFAULT 'Sin observaciones registradas.', recomendaciones TEXT DEFAULT 'Ninguna.', trabajos_realizados TEXT DEFAULT 'No especificado.', equipos_necesarios TEXT DEFAULT 'Ninguno.', tiempo_ejecucion TEXT DEFAULT '0 h', FOREIGN KEY (id_maquina) REFERENCES Maquinas (id_maquina))''')
-    
     conn.execute('''CREATE TABLE IF NOT EXISTS Repuestos_Orden (id_registro INTEGER PRIMARY KEY AUTOINCREMENT, id_mantenimiento INTEGER NOT NULL, id_repuesto INTEGER NOT NULL, cantidad_usada REAL NOT NULL, costo_unitario_historico REAL, FOREIGN KEY (id_mantenimiento) REFERENCES Calendario_Mantenimiento (id_mantenimiento) ON DELETE CASCADE, FOREIGN KEY (id_repuesto) REFERENCES Repuestos_Stock (id_repuesto))''')
     
-    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT")
+    # Alteraciones seguras para tablas ya existentes
+    try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN codigo_reman TEXT") # SIN UNIQUE PARA EVITAR ERROR SQLITE
     except sqlite3.OperationalError: pass 
     try: conn.execute("ALTER TABLE Calendario_Mantenimiento ADD COLUMN observaciones TEXT DEFAULT 'Sin observaciones registradas.'")
     except sqlite3.OperationalError: pass 
@@ -180,18 +182,25 @@ def registrar_compra_db(id_repuesto, cantidad, costo, proveedor, factura):
     finally:
         conn.close()
 
+def obtener_historial_compras_db():
+    conn = get_db_connection()
+    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
+    compras = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(ix) for ix in compras]
+
 def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_reman_manual=None):
     conn = get_db_connection()
     
     codigo_final = ""
     if codigo_reman_manual and str(codigo_reman_manual).strip():
-        # Si el usuario forzó un código (ej. 280), construimos "RE MAN-280"
+        # Validar si el usuario proporcionó un código inicial
         if not str(codigo_reman_manual).upper().startswith("RE MAN-"):
             codigo_final = f"RE MAN-{str(codigo_reman_manual).strip()}"
         else:
             codigo_final = str(codigo_reman_manual).strip().upper()
     else:
-        # Autogeneración secuencial basada en el último código ingresado
+        # Generar consecutivo dinámicamente
         cursor = conn.cursor()
         cursor.execute("SELECT codigo_reman FROM Calendario_Mantenimiento WHERE codigo_reman LIKE 'RE MAN-%' ORDER BY id_mantenimiento DESC LIMIT 1")
         ultimo = cursor.fetchone()
@@ -200,15 +209,13 @@ def crear_nueva_orden_db(id_maquina, tipo, descripcion, fecha, tecnico, codigo_r
             try:
                 partes = ultimo['codigo_reman'].split('-')
                 numero_actual = int(partes[1])
-                nuevo_numero = numero_actual + 1
-                codigo_final = f"RE MAN-{nuevo_numero}"
-            except (IndexError, ValueError):
+                codigo_final = f"RE MAN-{numero_actual + 1}"
+            except:
                 codigo_final = "RE MAN-100"
         else:
             codigo_final = "RE MAN-100"
 
     conn.execute("INSERT INTO Calendario_Mantenimiento (codigo_reman, id_maquina, tipo_mantenimiento, descripcion_tarea, fecha_programada, tecnico_asignado, estado_orden) VALUES (?, ?, ?, ?, ?, ?, 'Pendiente')", (codigo_final, id_maquina, tipo, descripcion, fecha, tecnico))
-    
     hoy = datetime.now().strftime('%Y-%m-%d')
     if fecha <= hoy:
         conn.execute("UPDATE Maquinas SET estado = 'En Mantenimiento' WHERE id_maquina = ?", (id_maquina,))
@@ -262,14 +269,6 @@ def crear_maquina_db(codigo, nombre, area, criticidad):
     conn.commit()
     conn.close()
 
-def obtener_historial_compras_db():
-    conn = get_db_connection()
-    query = "SELECT c.id_compra, r.codigo_pieza, r.nombre, c.cantidad, c.costo_unitario, (c.cantidad * c.costo_unitario) as costo_total, c.proveedor, c.factura, c.fecha_compra FROM Compras_Repuestos c JOIN Repuestos_Stock r ON c.id_repuesto = r.id_repuesto ORDER BY c.fecha_compra DESC, c.id_compra DESC"
-    compras = conn.execute(query).fetchall()
-    conn.close()
-    return [dict(ix) for ix in compras]
-
-
 # ==========================================
 # 2. INTERFACES DE USUARIO HTML (TEMPLATES)
 # ==========================================
@@ -315,7 +314,6 @@ LOGIN_TEMPLATE = """
         
         <form method="POST" action="/login" class="space-y-6">
             {% if next_url %}
-            <!-- Campo oculto para la redirección inteligente después de iniciar sesión -->
             <input type="hidden" name="next" value="{{ next_url }}">
             {% endif %}
             <div>
@@ -353,12 +351,19 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cafetec - Sistema de Mantenimiento</title>
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = { darkMode: 'class', theme: { extend: {} } }
     </script>
+    <!-- FontAwesome Icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
     
     <style>
@@ -381,6 +386,7 @@ HTML_TEMPLATE = """
         const CURRENT_ROLE = "{{ session.get('rol', 'Tecnico') }}";
     </script>
 
+    <!-- Notificación Flotante -->
     <div id="toast-notificacion" class="fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform translate-x-[150%] transition-transform duration-300 z-[100] border-l-4 border-cyan-500 font-bold flex items-center">
         <i id="toast-icon" class="fa-solid fa-circle-info mr-3 text-cyan-400 text-lg"></i>
         <span id="toast-msg">Mensaje</span>
@@ -406,11 +412,9 @@ HTML_TEMPLATE = """
                     <a href="/monitor" target="_blank" class="hidden sm:flex text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg items-center shadow-inner font-bold text-xs" title="Abrir Monitor de Planta">
                         <i class="fa-solid fa-display mr-2"></i> Monitor
                     </a>
-
                     <button onclick="toggleTheme()" class="text-slate-300 hover:text-cyan-400 transition-colors bg-slate-800 hover:bg-slate-700 p-2.5 rounded-full w-10 h-10 flex justify-center items-center shadow-inner" title="Cambiar Tema">
                         <i id="theme-icon" class="fa-solid fa-sun"></i>
                     </button>
-
                     <div class="text-sm font-medium bg-slate-900 pl-4 pr-2 py-1.5 rounded-full border border-slate-800 shadow-inner flex items-center text-slate-200">
                         <div class="flex flex-col text-right mr-3 leading-tight hidden sm:flex">
                             <span class="font-bold text-white text-[11px]">{{ session.get('nombre_completo', 'Usuario') }}</span>
@@ -431,6 +435,7 @@ HTML_TEMPLATE = """
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
+        <!-- Tarjetas de Resumen (KPIs) -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5 relative overflow-hidden group hover:shadow-md transition-all">
                 <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyan-500"></div>
@@ -472,6 +477,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Gráficos -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-sm border border-slate-200 dark:border-slate-800 p-5">
                 <h3 class="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center">
@@ -492,7 +498,9 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- TABLAS PRINCIPALES -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+            <!-- 1. Tabla de Órdenes -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
                 <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                     <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -521,6 +529,7 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <!-- 2. Tabla de Máquinas -->
             <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col h-auto">
                 <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                     <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -551,6 +560,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- 3. Inventario y Almacén -->
         <div class="bg-white dark:bg-slate-900 shadow-sm rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col mb-8">
             <div class="px-5 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-center">
                 <h3 class="text-sm font-bold text-slate-800 dark:text-slate-200 flex items-center">
@@ -585,6 +595,8 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODALES DE ESCRITORIO -->
+        <!-- MODAL: Programar/Editar Orden -->
         <div id="modal-orden" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 id="modal-orden-title" class="text-xl font-bold mb-5 text-white flex items-center">
@@ -593,6 +605,7 @@ HTML_TEMPLATE = """
                 <form id="form-nueva-orden" onsubmit="guardarOrden(event)">
                     <input type="hidden" id="orden-id">
                     
+                    <!-- CAMPO CÓDIGO RE MAN SECUENCIAL -->
                     <div class="mb-4 bg-slate-950 p-3 rounded-lg border border-slate-800" id="contenedor-reman">
                         <label class="block text-xs font-bold text-cyan-400 uppercase mb-1" title="Si lo dejas en blanco, el sistema generará el siguiente código automáticamente.">
                             <i class="fa-solid fa-barcode mr-1"></i> Forzar Código RE MAN (Opcional)
@@ -601,7 +614,7 @@ HTML_TEMPLATE = """
                             <span class="text-slate-500 font-bold mr-2 text-sm">RE MAN -</span>
                             <input type="number" id="input-reman-manual" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 text-white" placeholder="Ej: 280">
                         </div>
-                        <p class="text-[9px] text-slate-500 mt-1">Usa esto solo si deseas saltar la numeración y empezar desde un número específico.</p>
+                        <p class="text-[9px] text-slate-500 mt-1 mt-1">Usa esto solo si deseas saltar la numeración y empezar desde un número específico.</p>
                     </div>
 
                     <div class="mb-4">
@@ -636,6 +649,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Registrar Máquina -->
         <div id="modal-maquina" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center">
@@ -676,12 +690,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Ingreso de Mercadería (Compras) -->
         <div id="modal-compra" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-md relative border border-slate-700 modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-2 text-white flex items-center">
                     <i class="fa-solid fa-truck-ramp-box text-cyan-400 mr-2"></i> Ingreso de Mercadería
                 </h2>
                 <p id="compra-subtitulo" class="text-sm text-slate-400 mb-5 pb-3 border-b border-slate-800 font-medium">Repuesto Seleccionado</p>
+                
                 <form id="form-registro-compra" onsubmit="guardarCompra(event)">
                     <input type="hidden" id="compra-id-repuesto">
                     <div class="grid grid-cols-2 gap-4 mb-4">
@@ -704,7 +720,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="flex justify-end space-x-3 pt-4 border-t border-slate-700">
                         <button type="button" onclick="cerrarModalCompra()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
-                        <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
+                        <button type="submit" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-50 font-bold transition-all flex items-center">
                             <i class="fa-solid fa-check mr-2"></i> Registrar Stock
                         </button>
                     </div>
@@ -712,44 +728,53 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Completar Orden y Generar Reporte (ESCRITORIO) -->
         <div id="modal-completar" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-start pt-10 pb-10 backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-slate-900 p-8 rounded-xl shadow-2xl w-full max-w-2xl relative border border-slate-700 my-auto modal-content" onclick="event.stopPropagation()">
                 <h2 class="text-xl font-bold mb-5 text-white flex items-center border-b border-slate-800 pb-3">
                     <i class="fa-solid fa-file-signature text-cyan-400 mr-2"></i> Generar Reporte Técnico
                 </h2>
+                
                 <input type="hidden" id="completar-id-orden">
+                
                 <div class="mb-4">
                     <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Trabajos Realizados (Descripción Detallada)</label>
-                    <textarea id="input-trabajos" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
+                    <textarea id="input-trabajos" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="Describe paso a paso lo que se hizo durante el mantenimiento..."></textarea>
                 </div>
+
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Equipos/Herramientas Necesarios</label>
-                        <input type="text" id="input-equipos" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600">
+                        <input type="text" id="input-equipos" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600" placeholder="Ej: Multímetro, hidrolavadora, andamios..">
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Tiempo de Ejecución</label>
-                        <input type="text" id="input-tiempo" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600">
+                        <input type="text" id="input-tiempo" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600" placeholder="Ej: 2 horas, 45 min...">
                     </div>
                 </div>
+                
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4 pt-4 border-t border-slate-800">
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Observaciones Encontradas</label>
-                        <textarea id="input-obs" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
+                        <textarea id="input-obs" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="¿Qué fallas o detalles encontraste?"></textarea>
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-400 uppercase mb-2">Recomendaciones Futuras</label>
-                        <textarea id="input-rec" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none"></textarea>
+                        <textarea id="input-rec" rows="2" class="w-full border border-slate-700 rounded-lg p-3 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-950 text-white placeholder-slate-600 resize-none" placeholder="Ej: Cambiar filtro el próximo mes..."></textarea>
                     </div>
                 </div>
+
                 <div class="mb-4 bg-slate-800/50 p-4 rounded-lg border border-slate-700">
                     <label class="block text-xs font-bold text-cyan-400 uppercase mb-2"><i class="fa-solid fa-box-open mr-1"></i> Repuestos Utilizados</label>
                     <div class="flex space-x-2">
                         <select id="select-uso-repuesto" class="flex-1 min-w-0 flex-shrink-0 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white truncate"></select>
                         <input type="number" id="input-uso-cant" value="1" min="0.1" step="0.1" class="w-20 border border-slate-700 rounded-lg p-2 text-sm focus:ring-2 focus:ring-cyan-500 bg-slate-900 text-white" placeholder="Cant.">
-                        <button type="button" onclick="agregarRepuestoALista()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 rounded-lg font-bold transition-colors"><i class="fa-solid fa-plus"></i></button>
+                        <button type="button" onclick="agregarRepuestoALista()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 rounded-lg font-bold transition-colors">
+                            <i class="fa-solid fa-plus"></i>
+                        </button>
                     </div>
                 </div>
+
                 <div class="mb-6">
                     <div class="bg-slate-950 border border-slate-800 rounded-lg max-h-32 overflow-y-auto p-2">
                         <ul id="lista-repuestos-usados" class="divide-y divide-slate-800">
@@ -757,11 +782,13 @@ HTML_TEMPLATE = """
                         </ul>
                     </div>
                 </div>
+
                 <div class="mb-4 pt-4 border-t border-slate-800">
                     <label class="block text-xs font-bold text-slate-400 uppercase mb-2"><i class="fa-solid fa-camera mr-1"></i> Evidencia Fotográfica</label>
                     <input type="file" id="input-fotos" multiple accept="image/*" class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-cyan-900/50 file:text-cyan-400 hover:file:bg-cyan-900 transition-colors bg-slate-950 border border-slate-800 rounded-lg cursor-pointer" onchange="procesarImagenes(event)">
                     <div id="preview-fotos" class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3"></div>
                 </div>
+
                 <div class="flex justify-end space-x-3 pt-4 border-t border-slate-800">
                     <button type="button" onclick="cerrarModalCompletar()" class="px-5 py-2 bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 font-semibold transition-colors">Cancelar</button>
                     <button type="button" onclick="confirmarCompletarOrden()" class="px-5 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-500 font-bold transition-all flex items-center">
@@ -771,6 +798,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Historial de Auditoría (PDF) -->
         <div id="modal-historial" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -781,6 +809,7 @@ HTML_TEMPLATE = """
                         <i class="fa-solid fa-xmark text-2xl"></i>
                     </button>
                 </div>
+                
                 <div class="overflow-y-auto flex-1 bg-slate-50 dark:bg-slate-900 p-4">
                     <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
                         <thead class="bg-slate-900 sticky top-0 z-10 border-b-2 border-cyan-500">
@@ -799,6 +828,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- MODAL: Libro Mayor de Compras -->
         <div id="modal-historial-compras" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
             <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
                 <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
@@ -814,6 +844,7 @@ HTML_TEMPLATE = """
                         </button>
                     </div>
                 </div>
+                
                 <div class="overflow-y-auto flex-1 bg-slate-50 dark:bg-slate-900 p-4">
                     <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
                         <thead class="bg-slate-900 sticky top-0 z-10 border-b-2 border-cyan-500">
@@ -833,14 +864,19 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- BOTÓN FLOTANTE: Alertas -->
         <button id="btn-alertas-flotante" onclick="abrirModalAlertas(event)" class="hidden fixed bottom-8 right-8 z-50 bg-rose-600 hover:bg-rose-500 text-white rounded-full p-4 shadow-2xl transition-transform hover:scale-110 group">
             <span class="absolute top-0 right-0 -mt-1 -mr-1 flex h-4 w-4">
               <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
               <span class="relative inline-flex rounded-full h-4 w-4 bg-rose-500 border-2 border-white"></span>
             </span>
             <i class="fa-solid fa-bell text-2xl"></i>
+            <span class="absolute bottom-full right-0 mb-2 w-max px-3 py-1 bg-slate-900 text-white text-xs font-bold rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                Alertas de Stock
+            </span>
         </button>
 
+        <!-- PANEL FLOTANTE: Repuestos a Reabastecer -->
         <div id="modal-alertas-stock" class="hidden fixed bottom-24 right-8 bg-[#0f172a] p-5 rounded-xl shadow-2xl w-96 border border-slate-700 z-50 modal-content" onclick="event.stopPropagation()">
             <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
                 <h2 class="text-base font-bold text-white flex items-center">
@@ -861,15 +897,23 @@ HTML_TEMPLATE = """
             const html = document.documentElement;
             const isDark = html.classList.contains('dark');
             const icon = document.getElementById('theme-icon');
-            if (isDark) { html.classList.remove('dark'); localStorage.setItem('theme', 'light'); icon.className = 'fa-solid fa-moon'; actualizarGraficosTema(false); } 
-            else { html.classList.add('dark'); localStorage.setItem('theme', 'dark'); icon.className = 'fa-solid fa-sun text-amber-400'; actualizarGraficosTema(true); }
+            if (isDark) {
+                html.classList.remove('dark'); localStorage.setItem('theme', 'light');
+                icon.className = 'fa-solid fa-moon'; actualizarGraficosTema(false);
+            } else {
+                html.classList.add('dark'); localStorage.setItem('theme', 'dark');
+                icon.className = 'fa-solid fa-sun text-amber-400'; actualizarGraficosTema(true);
+            }
         }
 
         function applySavedTheme() {
             const html = document.documentElement;
             const icon = document.getElementById('theme-icon');
-            if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) { html.classList.add('dark'); if(icon) icon.className = 'fa-solid fa-sun text-amber-400'; } 
-            else { html.classList.remove('dark'); if(icon) icon.className = 'fa-solid fa-moon'; }
+            if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                html.classList.add('dark'); if(icon) icon.className = 'fa-solid fa-sun text-amber-400';
+            } else {
+                html.classList.remove('dark'); if(icon) icon.className = 'fa-solid fa-moon';
+            }
         }
         applySavedTheme();
 
@@ -877,8 +921,13 @@ HTML_TEMPLATE = """
             const toast = document.getElementById('toast-notificacion');
             const icon = document.getElementById('toast-icon');
             document.getElementById('toast-msg').innerText = mensaje;
-            if(tipo === 'error') { toast.className = "fixed top-5 right-5 bg-rose-600 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] font-bold flex items-center transition-transform duration-300"; icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg"; } 
-            else { toast.className = "fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] border-l-4 border-cyan-500 font-bold flex items-center transition-transform duration-300"; icon.className = "fa-solid fa-circle-check mr-3 text-cyan-400 text-lg"; }
+            if(tipo === 'error') {
+                toast.className = "fixed top-5 right-5 bg-rose-600 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] font-bold flex items-center transition-transform duration-300";
+                icon.className = "fa-solid fa-triangle-exclamation mr-3 text-white text-lg";
+            } else {
+                toast.className = "fixed top-5 right-5 bg-slate-900 dark:bg-slate-800 text-white px-6 py-3 rounded-lg shadow-2xl transform z-[100] border-l-4 border-cyan-500 font-bold flex items-center transition-transform duration-300";
+                icon.className = "fa-solid fa-circle-check mr-3 text-cyan-400 text-lg";
+            }
             toast.style.transform = "translateX(0)";
             setTimeout(() => { toast.style.transform = "translateX(150%)"; }, 3500);
         }
@@ -902,42 +951,53 @@ HTML_TEMPLATE = """
 
         fetch('/api/maquinas').then(response => response.json()).then(data => {
             document.getElementById('kpi-equipos').innerText = data.length;
-            let html = '';
-            let maquinasDetenidas = 0;
-            let maquinasOperativas = 0;
+            let html = ''; let maquinasDetenidas = 0; let maquinasOperativas = 0;
             data.forEach(maquina => {
-                if (maquina.estado !== 'Operativa') maquinasDetenidas++;
-                else maquinasOperativas++;
+                if (maquina.estado !== 'Operativa') maquinasDetenidas++; else maquinasOperativas++;
                 let btnImprimirQR = CURRENT_ROLE === 'Admin' ? `<a href="/api/maquinas/etiqueta/${maquina.id_maquina}" target="_blank" class="text-cyan-500 hover:text-cyan-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Imprimir QR"><i class="fa-solid fa-qrcode"></i></a>` : '';
                 let btnEliminar = CURRENT_ROLE === 'Admin' ? `<button onclick="eliminarMaquina(${maquina.id_maquina})" class="text-slate-300 dark:text-slate-600 hover:text-rose-600 dark:hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar equipo"><i class="fa-solid fa-trash-can"></i></button>` : '';
                 html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${maquina.codigo_equipo}</td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400"><div class="font-bold text-slate-800 dark:text-slate-200 uppercase">${maquina.nombre}</div><span class="text-[10px] text-slate-400 dark:text-slate-500 font-medium">Área: ${maquina.area_planta}</span></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(maquina.estado)}<div class="flex items-center">${btnImprimirQR}${btnEliminar}</div></div></td></tr>`;
             });
             document.getElementById('tabla-maquinas').innerHTML = html;
+
             const border = document.getElementById('kpi-planta-border'); const iconBg = document.getElementById('kpi-planta-icon-bg'); const icon = document.getElementById('kpi-planta-icon'); const text = document.getElementById('kpi-planta-text');
             if (data.length === 0) { text.innerText = "Sin Datos"; } 
-            else if (maquinasDetenidas === 0) { text.innerText = "Operativa"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white"; icon.className = "fa-solid fa-check-double text-sm"; } 
-            else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) { text.innerText = "Op. Parcial"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white"; icon.className = "fa-solid fa-triangle-exclamation text-sm"; } 
-            else { text.innerText = "Parada General"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300"; iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white"; icon.className = "fa-solid fa-circle-xmark text-sm"; }
+            else if (maquinasDetenidas === 0) {
+                text.innerText = "Operativa"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-emerald-500 transition-colors duration-300";
+                iconBg.className = "w-10 h-10 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-100 dark:border-emerald-800 flex items-center justify-center text-emerald-600 dark:text-emerald-400 transition-colors duration-300 group-hover:bg-emerald-500 group-hover:text-white"; icon.className = "fa-solid fa-check-double text-sm";
+            } else if (maquinasDetenidas > 0 && maquinasDetenidas < data.length) {
+                text.innerText = "Op. Parcial"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-amber-500 transition-colors duration-300";
+                iconBg.className = "w-10 h-10 rounded-full bg-amber-50 dark:bg-amber-900/30 border border-amber-100 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400 transition-colors duration-300 group-hover:bg-amber-500 group-hover:text-white"; icon.className = "fa-solid fa-triangle-exclamation text-sm";
+            } else {
+                text.innerText = "Parada General"; border.className = "absolute left-0 top-0 bottom-0 w-1 bg-rose-500 transition-colors duration-300";
+                iconBg.className = "w-10 h-10 rounded-full bg-rose-50 dark:bg-rose-900/30 border border-rose-100 dark:border-rose-800 flex items-center justify-center text-rose-600 dark:text-rose-400 transition-colors duration-300 group-hover:bg-rose-500 group-hover:text-white"; icon.className = "fa-solid fa-circle-xmark text-sm";
+            }
+
             const isDark = document.documentElement.classList.contains('dark'); const darkColor = isDark ? '#334155' : '#1e293b';
-            chartMaquinas = new Chart(document.getElementById('graficoMaquinas').getContext('2d'), { type: 'doughnut', data: { labels: ['Operativas', 'En Mantenimiento'], datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' } });
+            const ctxMaquinas = document.getElementById('graficoMaquinas').getContext('2d');
+            chartMaquinas = new Chart(ctxMaquinas, { type: 'doughnut', data: { labels: ['Operativas', 'En Mantenimiento'], datasets: [{ data: [maquinasOperativas, maquinasDetenidas], backgroundColor: ['#22d3ee', darkColor], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } }, cutout: '75%' } });
         });
 
         fetch('/api/ordenes').then(response => response.json()).then(data => {
             document.getElementById('kpi-ordenes').innerText = data.length;
             let html = ''; let prev = 0, corr = 0, pred = 0;
-            if(data.length === 0) { html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>'; } 
-            else {
+            if(data.length === 0) {
+                html = '<tr><td colspan="3" class="px-5 py-6 text-center text-xs text-slate-500 dark:text-slate-400 italic font-semibold">No hay órdenes pendientes. ¡Buen trabajo!</td></tr>';
+            } else {
                 data.forEach(orden => {
                     if(orden.tipo_mantenimiento === 'Preventivo') prev++; if(orden.tipo_mantenimiento === 'Correctivo') corr++; if(orden.tipo_mantenimiento === 'Predictivo') pred++;
                     let btnsAdmin = '';
-                    if (CURRENT_ROLE === 'Admin') { btnsAdmin = `<button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button><button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>`; }
+                    if (CURRENT_ROLE === 'Admin') {
+                        btnsAdmin = `<button onclick="editarOrden(${orden.id_mantenimiento}, ${orden.id_maquina}, '${orden.tipo_mantenimiento}', '${orden.descripcion_tarea}', '${orden.fecha_programada}', '${orden.tecnico_asignado}')" class="text-amber-500 hover:text-amber-400 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Editar Orden"><i class="fa-solid fa-pen-to-square"></i></button><button onclick="eliminarOrden(${orden.id_mantenimiento})" class="text-rose-600 hover:text-rose-500 transition-colors ml-2 opacity-0 group-hover:opacity-100" title="Eliminar Orden"><i class="fa-solid fa-trash-can"></i></button>`;
+                    }
                     let codRemanDisplay = orden.codigo_reman ? `<span class="bg-slate-800 text-cyan-400 border border-slate-700 px-1.5 py-0.5 rounded text-[9px] font-bold block mb-1 w-max">${orden.codigo_reman}</span>` : '';
                     html += `<tr class="hover:bg-cyan-50 dark:hover:bg-slate-800/50 transition-colors group"><td class="px-5 py-3 whitespace-nowrap text-[11px] font-bold text-slate-800 dark:text-slate-200">${orden.codigo_equipo}</td><td class="px-5 py-3 text-[11px] text-slate-600 dark:text-slate-400">${codRemanDisplay}<div class="font-bold text-slate-800 dark:text-slate-200">${orden.tipo_mantenimiento}</div><div class="truncate w-40 text-slate-500 dark:text-slate-400" title="${orden.descripcion_tarea}">${orden.descripcion_tarea}</div><div class="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold mt-0.5"><i class="fa-regular fa-calendar mr-1"></i> ${orden.fecha_programada}</div></td><td class="px-5 py-3 whitespace-nowrap"><div class="flex items-center justify-between">${getBadge(orden.estado_orden)}<div class="flex items-center">${btnsAdmin}<button onclick="abrirModalCompletar(${orden.id_mantenimiento})" class="text-slate-400 dark:text-slate-500 hover:text-cyan-500 dark:hover:text-cyan-400 transition-colors ml-3 opacity-0 group-hover:opacity-100" title="Marcar finalizada y generar reporte"><i class="fa-solid fa-file-signature text-xl"></i></button></div></div></td></tr>`;
                 });
             }
             document.getElementById('tabla-ordenes').innerHTML = html;
             const isDark = document.documentElement.classList.contains('dark'); const darkGrid = isDark ? '#334155' : '#e2e8f0'; const darkText = isDark ? '#94a3b8' : '#64748b';
-            chartOrdenes = new Chart(document.getElementById('graficoOrdenes').getContext('2d'), { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
+            const ctxOrdenes = document.getElementById('graficoOrdenes').getContext('2d');
+            chartOrdenes = new Chart(ctxOrdenes, { type: 'bar', data: { labels: ['Preventivo', 'Correctivo', 'Predictivo'], datasets: [{ label: 'Órdenes Activas', data: [prev, corr, pred], backgroundColor: ['#22d3ee', '#e11d48', '#64748b'], borderRadius: 3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, grid: { color: darkGrid }, ticks: { stepSize: 1, precision: 0, font: {size: 10}, color: darkText } }, x: { grid: { display: false }, ticks: {font: {size: 10}, color: darkText} } } } });
         });
 
         fetch('/api/inventario').then(response => response.json()).then(data => {
@@ -945,9 +1005,14 @@ HTML_TEMPLATE = """
             data.forEach(item => {
                 let estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/50 uppercase tracking-wide">Óptimo</span>';
                 let textClass = "text-slate-800 dark:text-slate-200";
-                if (item.cantidad_actual <= item.punto_reorden) { estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>'; textClass = "text-rose-600 dark:text-rose-400 font-bold"; itemsCriticos++; htmlAlertas += `<li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm"><div><span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span><span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span></div><div class="text-right flex flex-col items-end"><div class="flex items-baseline space-x-1"><span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span></div><div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div></div></li>`; }
+                if (item.cantidad_actual <= item.punto_reorden) {
+                    estadoStock = '<span class="px-2.5 py-1 inline-flex text-[10px] leading-5 font-bold rounded-md bg-rose-50 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border border-rose-200 dark:border-rose-800/50 uppercase tracking-wide">Reabastecer</span>'; textClass = "text-rose-600 dark:text-rose-400 font-bold"; itemsCriticos++;
+                    htmlAlertas += `<li class="p-3 bg-slate-900 border border-slate-800 rounded-lg flex justify-between items-center transition-colors shadow-sm"><div><span class="text-rose-400 font-bold block text-sm">${item.codigo_pieza}</span><span class="text-slate-400 text-xs w-48 truncate block">${item.nombre}</span></div><div class="text-right flex flex-col items-end"><div class="flex items-baseline space-x-1"><span class="text-rose-500 text-lg font-bold">${item.cantidad_actual}</span> <span class="text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span></div><div class="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wide bg-slate-800 px-1.5 py-0.5 rounded">Mín: ${item.punto_reorden}</div></div></li>`;
+                }
                 let botonesAccionHtml = '';
-                if(CURRENT_ROLE === 'Admin') { botonesAccionHtml = `<div class="flex items-center space-x-1"><button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button><button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button><div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div><button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button></div>`; }
+                if(CURRENT_ROLE === 'Admin') {
+                    botonesAccionHtml = `<div class="flex items-center space-x-1"><button onclick="descontarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (-)"><i class="fa-solid fa-minus text-[10px]"></i></button><button onclick="sumarStock(${item.id_repuesto})" class="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 w-6 h-6 rounded border border-slate-200 dark:border-slate-700 shadow-sm flex items-center justify-center transition-colors" title="Ajuste Rápido (+)"><i class="fa-solid fa-plus text-[10px]"></i></button><div class="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div><button onclick="abrirModalCompra(${item.id_repuesto}, '${item.codigo_pieza}', '${item.nombre}')" class="bg-cyan-50 dark:bg-cyan-900/30 hover:bg-cyan-100 dark:hover:bg-cyan-900/60 text-cyan-600 dark:text-cyan-400 w-6 h-6 rounded border border-cyan-200 dark:border-cyan-800/50 shadow-sm flex items-center justify-center transition-colors" title="Registrar Ingreso (Compra)"><i class="fa-solid fa-file-invoice-dollar text-[10px]"></i></button></div>`;
+                }
                 html += `<tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors"><td class="px-5 py-3 whitespace-nowrap"><div class="text-[11px] font-bold text-slate-800 dark:text-slate-200">${item.codigo_pieza}</div><div class="text-[11px] text-slate-500 dark:text-slate-400">${item.nombre}</div></td><td class="px-5 py-3 whitespace-nowrap text-[11px] text-slate-600 dark:text-slate-400 font-medium"><i class="fa-solid fa-location-dot mr-1 text-slate-400 dark:text-slate-500"></i> ${item.ubicacion_almacen}</td><td class="px-5 py-3 whitespace-nowrap text-[11px]"><div class="flex items-center space-x-3"><div class="w-16"><span class="${textClass} text-lg">${item.cantidad_actual}</span> <span class="text-slate-400 dark:text-slate-500 text-[10px] font-semibold">${item.unidad_medida}</span><div class="text-[9px] text-slate-400 dark:text-slate-500 font-medium uppercase mt-0.5">Mínimo: ${item.punto_reorden}</div></div>${botonesAccionHtml}</div></td><td class="px-5 py-3 whitespace-nowrap">${estadoStock}</td></tr>`;
             });
             document.getElementById('tabla-inventario').innerHTML = html;
@@ -991,7 +1056,8 @@ HTML_TEMPLATE = """
 
         function editarOrden(id_orden, id_maquina, tipo, desc, fecha, tecnico) {
             document.getElementById('modal-orden-title').innerHTML = '<i class="fa-solid fa-pen-to-square text-amber-500 mr-2"></i> Editar Orden';
-            document.getElementById('orden-id').value = id_orden; document.getElementById('select-tipo').value = tipo; document.getElementById('input-descripcion').value = desc; document.getElementById('input-fecha').value = fecha; document.getElementById('input-tecnico').value = tecnico; document.getElementById('contenedor-reman').classList.add('hidden');
+            document.getElementById('orden-id').value = id_orden; document.getElementById('select-tipo').value = tipo; document.getElementById('input-descripcion').value = desc; document.getElementById('input-fecha').value = fecha; document.getElementById('input-tecnico').value = tecnico;
+            document.getElementById('contenedor-reman').classList.add('hidden');
             fetch('/api/maquinas').then(r => r.json()).then(data => { let s = document.getElementById('select-maquina'); s.innerHTML = ''; data.forEach(m => { let sel = m.id_maquina === id_maquina ? 'selected' : ''; s.innerHTML += `<option value="${m.id_maquina}" ${sel}>${m.codigo_equipo} - ${m.nombre}</option>`; }); });
             document.getElementById('modal-orden').classList.remove('hidden');
         }
@@ -1304,6 +1370,71 @@ MOBILE_MACHINE_TEMPLATE = """
 </html>
 """
 
+MONITOR_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitor de Planta | CAFETEC</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Rajdhani:wght@700&display=swap" rel="stylesheet">
+    <style> body { font-family: 'Inter', sans-serif; background-color: #020617; color: white; overflow: hidden; } .fuente-logo { font-family: 'Rajdhani', sans-serif; } </style>
+</head>
+<body class="flex flex-col h-screen p-4 gap-4">
+    <header class="flex justify-between items-center bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-2xl shrink-0">
+        <div class="flex items-center">
+            <div class="flex items-center bg-slate-950 border-2 border-slate-700 rounded-lg px-3 py-1 shadow-[0_0_15px_rgba(6,182,212,0.15)]"><span class="text-cyan-400 font-bold text-4xl fuente-logo tracking-wider">CAFE</span><span class="text-white font-bold text-4xl fuente-logo tracking-wider ml-1">TEC</span></div>
+            <span class="ml-6 pl-6 border-l-2 border-slate-700 text-slate-400 uppercase tracking-widest font-bold text-lg flex items-center"><i class="fa-solid fa-tower-broadcast text-rose-500 animate-pulse mr-3"></i> Monitor en Tiempo Real</span>
+        </div>
+        <div class="text-right flex flex-col items-end"><div id="reloj" class="text-4xl font-black text-white tracking-widest font-mono drop-shadow-md">00:00:00</div><div id="fecha" class="text-cyan-400 text-sm font-bold uppercase mt-1">---</div></div>
+    </header>
+    <main class="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
+        <div class="flex flex-col gap-4 min-h-0">
+            <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center items-center text-center relative overflow-hidden">
+                <div id="bg-estado" class="absolute inset-0 opacity-10 bg-emerald-500 transition-colors duration-1000"></div><div class="absolute top-4 left-4 flex items-center text-slate-500 text-xs font-bold uppercase tracking-widest"><i class="fa-solid fa-circle-dot mr-2"></i> Estatus Planta</div><div id="estado-texto" class="text-[3.5rem] leading-none font-black text-emerald-400 z-10 transition-colors duration-1000 mt-4">OPERATIVA</div>
+            </div>
+            <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex-1 flex flex-col justify-center">
+                <h2 class="text-slate-400 font-bold uppercase tracking-widest mb-6 text-sm"><i class="fa-solid fa-list-check mr-2"></i> Progreso de Órdenes (Hoy)</h2>
+                <div class="flex justify-between items-end mb-4"><div><span class="text-[3.5rem] leading-none font-black text-white" id="ordenes-progreso">0/0</span><span class="text-slate-500 font-bold ml-2 uppercase text-sm">Completadas</span></div><span class="text-cyan-400 font-black text-4xl" id="ordenes-porcentaje">0%</span></div>
+                <div class="w-full bg-slate-950 rounded-full h-6 border border-slate-800 overflow-hidden shadow-inner"><div class="bg-cyan-500 h-full rounded-full transition-all duration-1000 relative overflow-hidden" id="barra-progreso" style="width: 0%"><div class="absolute inset-0 bg-white/20 w-full h-full" style="background-image: linear-gradient(45deg,rgba(255,255,255,.15) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.15) 50%,rgba(255,255,255,.15) 75%,transparent 75%,transparent); background-size: 1rem 1rem;"></div></div></div>
+            </div>
+        </div>
+        <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col items-center relative overflow-hidden min-h-0">
+            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 to-blue-500"></div><h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 w-full text-left text-sm flex items-center shrink-0"><i class="fa-solid fa-chart-pie mr-2"></i> Disponibilidad de Equipos</h2>
+            <div class="flex-1 w-full relative flex items-center justify-center min-h-0"><div class="relative w-full h-full max-h-64 flex justify-center items-center"><canvas id="chartDisponibilidad"></canvas><div class="absolute inset-0 flex items-center justify-center pointer-events-none flex-col mt-4"><span class="text-6xl font-black text-white drop-shadow-lg" id="disp-porcentaje">100%</span><span class="text-sm text-emerald-400 font-bold uppercase tracking-widest mt-1">Online</span></div></div></div>
+            <div class="w-full mt-4 flex justify-center space-x-6 shrink-0"><div class="flex items-center"><span class="w-4 h-4 rounded-full bg-emerald-500 mr-2 shadow-[0_0_10px_rgba(16,185,129,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">Operativas</span></div><div class="flex items-center"><span class="w-4 h-4 rounded-full bg-rose-600 mr-2 shadow-[0_0_10px_rgba(225,29,72,0.5)]"></span><span class="text-slate-300 font-bold uppercase text-xs tracking-wider">En Mantenimiento</span></div></div>
+        </div>
+        <div class="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-2xl flex flex-col relative overflow-hidden min-h-0">
+            <div class="absolute top-0 w-full h-1.5 bg-gradient-to-r from-rose-500 to-orange-500"></div><h2 class="text-slate-400 font-bold uppercase tracking-widest mb-4 flex justify-between items-center text-sm shrink-0"><span><i class="fa-solid fa-triangle-exclamation mr-2"></i> Equipos Detenidos</span><span class="bg-rose-600 text-white px-3 py-1 rounded-lg text-lg shadow-[0_0_15px_rgba(225,29,72,0.5)]" id="badge-detenidos">0</span></h2>
+            <div class="flex-1 overflow-y-auto pr-2 space-y-3 min-h-0" id="lista-detenidos"><div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50"><i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i><p class="font-bold text-lg">Todos los equipos operativos</p></div></div>
+        </div>
+    </main>
+    <script>
+        function actualizarReloj() { const ahora = new Date(); document.getElementById('reloj').textContent = ahora.toLocaleTimeString('es-ES', { hour12: false }); const opciones = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }; let fechaStr = ahora.toLocaleDateString('es-ES', opciones); document.getElementById('fecha').textContent = fechaStr; } setInterval(actualizarReloj, 1000); actualizarReloj();
+        let chartDisp = null;
+        function actualizarDatos() {
+            fetch('/api/monitor_data').then(r => r.json()).then(d => {
+                const totOrd = d.ordenes.total; const compOrd = d.ordenes.completadas; document.getElementById('ordenes-progreso').textContent = `${compOrd}/${totOrd}`; let pctOrd = 100; if(totOrd > 0) pctOrd = Math.round((compOrd / totOrd) * 100);
+                const countUp = (id, target) => { document.getElementById(id).textContent = target + '%'; }; countUp('ordenes-porcentaje', pctOrd); document.getElementById('barra-progreso').style.width = `${pctOrd}%`;
+                const totMaq = d.maquinas.total; const opMaq = d.maquinas.operativas; const detMaq = d.maquinas.detenidas;
+                let estadoGlobal = 'OPERATIVA'; let colorEstado = 'emerald'; if(detMaq.length > 0 && detMaq.length < totMaq) { estadoGlobal = 'OP. PARCIAL'; colorEstado = 'amber'; } else if(detMaq.length === totMaq && totMaq > 0) { estadoGlobal = 'PARADA GENERAL'; colorEstado = 'rose'; }
+                const bgEstado = document.getElementById('bg-estado'); const txtEstado = document.getElementById('estado-texto'); bgEstado.className = `absolute inset-0 opacity-10 bg-${colorEstado}-500 transition-colors duration-1000`; txtEstado.className = `text-[3.5rem] leading-none font-black text-${colorEstado}-400 z-10 transition-colors duration-1000 mt-4`; txtEstado.textContent = estadoGlobal;
+                let pctDisp = 100; if(totMaq > 0) pctDisp = Math.round((opMaq / totMaq) * 100); countUp('disp-porcentaje', pctDisp);
+                if(!chartDisp) { const ctx = document.getElementById('chartDisponibilidad').getContext('2d'); chartDisp = new Chart(ctx, { type: 'doughnut', data: { labels: ['Operativas', 'Detenidas'], datasets: [{ data: [opMaq, detMaq.length], backgroundColor: ['#10B981', '#E11D48'], borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, cutout: '80%', plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateScale: true } } }); } else { chartDisp.data.datasets[0].data = [opMaq, detMaq.length]; chartDisp.update(); }
+                document.getElementById('badge-detenidos').textContent = detMaq.length; const lista = document.getElementById('lista-detenidos');
+                if(detMaq.length === 0) { lista.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-slate-500 italic opacity-50 transition-opacity duration-500"><i class="fa-solid fa-check-circle text-6xl mb-4 text-emerald-500"></i><p class="font-bold text-lg">Todos los equipos operativos</p></div>`; } 
+                else { lista.innerHTML = detMaq.map(m => `<div class="bg-slate-950 border-l-4 border-rose-500 rounded-lg p-4 shadow-md flex items-center justify-between transform transition-all duration-300 hover:scale-105"><div><div class="font-black text-rose-400 text-lg tracking-wider">${m.codigo_equipo}</div><div class="text-slate-300 font-medium truncate w-48 text-sm">${m.nombre}</div></div><div class="w-10 h-10 rounded-full bg-rose-900/30 flex items-center justify-center text-rose-500 animate-pulse"><i class="fa-solid fa-wrench"></i></div></div>`).join(''); }
+            }).catch(err => console.error("Error en monitor:", err));
+        }
+        setInterval(actualizarDatos, 5000); actualizarDatos();
+    </script>
+</body>
+</html>
+"""
+
 # ==========================================
 # 3. CONTROLADORES DE RUTAS
 # ==========================================
@@ -1314,6 +1445,7 @@ def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
+        
         conn = get_db_connection()
         user = conn.execute('SELECT * FROM Usuarios WHERE username = ?', (username,)).fetchone()
         conn.close()
@@ -1323,29 +1455,51 @@ def login():
             session['username'] = user['username']
             session['nombre_completo'] = user['nombre_completo']
             session['rol'] = user['rol']
+            
             if next_url: return redirect(next_url)
             return redirect(url_for('dashboard'))
+            
         return render_template_string(LOGIN_TEMPLATE, error="Usuario o contraseña incorrectos", next_url=next_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, next_url=next_url)
 
 @app.route('/logout')
-def logout(): session.clear(); return redirect(url_for('login'))
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 @app.route('/')
-def dashboard(): return render_template_string(HTML_TEMPLATE)
+def dashboard(): 
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/monitor')
-def monitor(): return render_template_string(MONITOR_TEMPLATE)
+def monitor():
+    return render_template_string(MONITOR_TEMPLATE)
 
 @app.route('/maquina/<int:id_maquina>')
 def vista_movil_maquina(id_maquina):
     conn = get_db_connection()
     maquina = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
-    if not maquina: conn.close(); return "Máquina no encontrada", 404
-    ordenes_pendientes = conn.execute("SELECT * FROM Calendario_Mantenimiento WHERE id_maquina = ? AND estado_orden IN ('Pendiente', 'En Progreso') ORDER BY fecha_programada ASC", (id_maquina,)).fetchall()
-    historial = conn.execute("SELECT * FROM Calendario_Mantenimiento WHERE id_maquina = ? AND estado_orden = 'Completada' ORDER BY fecha_ejecucion DESC LIMIT 3", (id_maquina,)).fetchall()
+    if not maquina:
+        conn.close()
+        return "Máquina no encontrada", 404
+        
+    ordenes_pendientes = conn.execute('''
+        SELECT * FROM Calendario_Mantenimiento 
+        WHERE id_maquina = ? AND estado_orden IN ('Pendiente', 'En Progreso')
+        ORDER BY fecha_programada ASC
+    ''', (id_maquina,)).fetchall()
+    
+    historial = conn.execute('''
+        SELECT * FROM Calendario_Mantenimiento 
+        WHERE id_maquina = ? AND estado_orden = 'Completada'
+        ORDER BY fecha_ejecucion DESC LIMIT 3
+    ''', (id_maquina,)).fetchall()
     conn.close()
-    return render_template_string(MOBILE_MACHINE_TEMPLATE, maquina=maquina, ordenes=[dict(o) for o in ordenes_pendientes], historial=[dict(h) for h in historial])
+    
+    return render_template_string(MOBILE_MACHINE_TEMPLATE, 
+                                  maquina=maquina, 
+                                  ordenes=[dict(o) for o in ordenes_pendientes],
+                                  historial=[dict(h) for h in historial])
 
 @app.route('/api/maquinas/etiqueta/<int:id_maquina>')
 def api_etiqueta_qr(id_maquina):
@@ -1353,15 +1507,50 @@ def api_etiqueta_qr(id_maquina):
     m = conn.execute('SELECT * FROM Maquinas WHERE id_maquina = ?', (id_maquina,)).fetchone()
     conn.close()
     if not m: return "Máquina no encontrada", 404
+    
     url_maquina = request.host_url.rstrip('/') + url_for('vista_movil_maquina', id_maquina=id_maquina)
     qr = qrcode.QRCode(version=1, box_size=10, border=1)
     qr.add_data(url_maquina)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
+    
     buffered = io.BytesIO()
     img.save(buffered, format="PNG")
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    ETIQUETA_HTML = """<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Imprimir Etiqueta QR - {{ m.codigo_equipo }}</title><style>body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #e2e8f0; margin: 0; } .etiqueta { width: 400px; height: 200px; background: white; border: 2px solid black; display: flex; padding: 10px; box-sizing: border-box; border-radius: 8px;} .info { flex: 1; display: flex; flex-col; flex-direction: column; justify-content: center; padding-right: 10px; } .qr-container { width: 150px; display: flex; justify-content: center; align-items: center; border-left: 2px dashed #cbd5e1; padding-left: 10px; } h1 { margin: 0; font-size: 24px; color: #0f172a; } h2 { margin: 5px 0 0 0; font-size: 14px; color: #64748b; font-weight: normal; } .logo { font-family: Impact, sans-serif; font-size: 20px; font-weight: bold; margin-bottom: 15px; } .logo-c { color: #0ea5e9; } img { max-width: 100%; max-height: 100%; } @media print { body { background: white; } .no-print { display: none; } .etiqueta { border: none; border-radius: 0; } } .btn-imprimir { position: fixed; top: 20px; padding: 10px 20px; background: #0ea5e9; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px;}</style></head><body><button class="btn-imprimir no-print" onclick="window.print()">🖨️ Imprimir Etiqueta</button><div class="etiqueta"><div class="info"><div class="logo"><span class="logo-c">CAFE</span>TEC</div><h1>{{ m.codigo_equipo }}</h1><h2>{{ m.nombre }}</h2></div><div class="qr-container"><img src="data:image/png;base64,{{ qr_img }}" alt="QR"></div></div></body></html>"""
+    
+    ETIQUETA_HTML = """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Imprimir Etiqueta QR - {{ m.codigo_equipo }}</title>
+        <style>
+            body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #e2e8f0; margin: 0; }
+            .etiqueta { width: 400px; height: 200px; background: white; border: 2px solid black; display: flex; padding: 10px; box-sizing: border-box; border-radius: 8px;}
+            .info { flex: 1; display: flex; flex-col; flex-direction: column; justify-content: center; padding-right: 10px; }
+            .qr-container { width: 150px; display: flex; justify-content: center; align-items: center; border-left: 2px dashed #cbd5e1; padding-left: 10px; }
+            h1 { margin: 0; font-size: 24px; color: #0f172a; }
+            h2 { margin: 5px 0 0 0; font-size: 14px; color: #64748b; font-weight: normal; }
+            .logo { font-family: Impact, sans-serif; font-size: 20px; font-weight: bold; margin-bottom: 15px; }
+            .logo-c { color: #0ea5e9; }
+            img { max-width: 100%; max-height: 100%; }
+            @media print { body { background: white; } .no-print { display: none; } .etiqueta { border: none; border-radius: 0; } }
+            .btn-imprimir { position: fixed; top: 20px; padding: 10px 20px; background: #0ea5e9; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 16px;}
+        </style>
+    </head>
+    <body>
+        <button class="btn-imprimir no-print" onclick="window.print()">🖨️ Imprimir Etiqueta</button>
+        <div class="etiqueta">
+            <div class="info">
+                <div class="logo"><span class="logo-c">CAFE</span>TEC</div>
+                <h1>{{ m.codigo_equipo }}</h1>
+                <h2>{{ m.nombre }}</h2>
+            </div>
+            <div class="qr-container"><img src="data:image/png;base64,{{ qr_img }}" alt="QR"></div>
+        </div>
+    </body>
+    </html>
+    """
     return render_template_string(ETIQUETA_HTML, m=m, qr_img=img_str)
 
 @app.route('/api/monitor_data')
@@ -1380,12 +1569,16 @@ def api_monitor_data():
 
 @app.route('/api/maquinas')
 def api_maquinas(): return jsonify(obtener_todas_las_maquinas())
+
 @app.route('/api/ordenes')
 def api_ordenes(): return jsonify(obtener_mantenimientos_pendientes())
+
 @app.route('/api/historial')
 def api_historial(): return jsonify(obtener_historial_db())
+
 @app.route('/api/inventario')
 def api_inventario(): return jsonify(obtener_inventario())
+
 @app.route('/api/compras')
 def api_compras(): return jsonify(obtener_historial_compras_db())
 
@@ -1412,6 +1605,7 @@ def api_registrar_compra(id_repuesto):
 def api_nueva_orden():
     if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
     d = request.json
+    # Se envía el código manual (si el admin lo llenó en el input)
     crear_nueva_orden_db(d['id_maquina'], d['tipo_mantenimiento'], d['descripcion'], d['fecha'], d['tecnico'], d.get('codigo_reman_manual', ''))
     return jsonify({"status": "ok"})
 
@@ -1468,7 +1662,8 @@ def api_exportar_inventario():
         cell = ws.cell(row=1, column=col_num)
         cell.fill = fill
         cell.font = font
-    for item in inventario: ws.append([item['codigo_pieza'], item['nombre'], item['descripcion'], item['cantidad_actual'], item['punto_reorden'], item['unidad_medida'], item['ubicacion_almacen']])
+    for item in inventario: 
+        ws.append([item['codigo_pieza'], item['nombre'], item['descripcion'], item['cantidad_actual'], item['punto_reorden'], item['unidad_medida'], item['ubicacion_almacen']])
     file_stream = io.BytesIO()
     wb.save(file_stream)
     file_stream.seek(0)
@@ -1488,7 +1683,8 @@ def api_exportar_compras():
         cell = ws.cell(row=1, column=col_num)
         cell.fill = fill
         cell.font = font
-    for item in compras: ws.append([item['fecha_compra'], item['codigo_pieza'], item['nombre'], item['cantidad'], item['costo_unitario'], item['costo_total'], item['proveedor'], item['factura']])
+    for item in compras: 
+        ws.append([item['fecha_compra'], item['codigo_pieza'], item['nombre'], item['cantidad'], item['costo_unitario'], item['costo_total'], item['proveedor'], item['factura']])
     file_stream = io.BytesIO()
     wb.save(file_stream)
     file_stream.seek(0)
@@ -1518,23 +1714,24 @@ def api_descargar_reporte(id_orden):
     title_style = ParagraphStyle(name='Title', fontName='Helvetica-Bold', fontSize=11, spaceAfter=8, spaceBefore=14, textColor=colors.HexColor('#0F172A'))
     normal_style = ParagraphStyle(name='NormalCustom', fontName='Helvetica', fontSize=10, spaceAfter=4, leading=14)
 
-    logo_path = os.path.join(BASE_DIR, "logo_cafetec.jpg")
+    logo_path = "logo_cafetec.jpg"
     celda_logo = Image(logo_path, width=112, height=55, kind='proportional') if os.path.exists(logo_path) else Paragraph("<font color='white'><b>CAFETEC</b></font>", ParagraphStyle(name='LogoFB', alignment=1, fontName='Times-Bold', fontSize=14))
     p_tit_top = Paragraph("REGISTRO DE MANTENIMIENTO", ParagraphStyle(name='TitTop', alignment=1, fontName='Times-Bold', fontSize=11, leading=14))
     p_tit_bot = Paragraph(f"MANTENIMIENTO DE MAQUINA {orden['maquina_nombre'].upper()}", ParagraphStyle(name='TitBot', alignment=1, fontName='Times-Bold', fontSize=10, textColor=colors.HexColor('#004b87'), leading=12)) 
     lbl_style = ParagraphStyle(name='Lbl', alignment=0, fontName='Times-Roman', fontSize=10)
     val_style = ParagraphStyle(name='Val', alignment=0, fontName='Times-Roman', fontSize=10)
     
-    codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
     fecha_format = orden['fecha_ejecucion']
     try:
         f_obj = datetime.strptime(fecha_format, '%Y-%m-%d')
         fecha_format = f_obj.strftime('%d/%m/%y')
     except: pass
     
+    codigo_pdf = orden['codigo_reman'] if orden['codigo_reman'] else "RE MAN-000"
+    
     header_data = [[celda_logo, p_tit_top, Paragraph("Código:", lbl_style), Paragraph(codigo_pdf, val_style)], ["", "", Paragraph("Versión:", lbl_style), Paragraph("001", val_style)], ["", p_tit_bot, Paragraph("Fecha:", lbl_style), Paragraph(fecha_format, val_style)], ["", "", Paragraph("Página:", lbl_style), Paragraph("1", val_style)]]
     t_header = Table(header_data, colWidths=[120, 250, 60, 80], rowHeights=[15, 15, 15, 15])
-    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black), ('LEFTPADDING', (0,0), (-1,-1), 4), ('RIGHTPADDING', (0,0), (-1,-1), 4), ('BOTTOMPADDING', (0,0), (-1,-1), 2), ('TOPPADDING', (0,0), (-1,-1), 2)]))
+    t_header.setStyle(TableStyle([('SPAN', (0, 0), (0, 3)), ('SPAN', (1, 0), (1, 1)), ('SPAN', (1, 2), (1, 3)), ('BACKGROUND', (0, 0), (0, 3), colors.black), ('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.black)]))
     elements.append(t_header)
     elements.append(Spacer(1, 15))
 
@@ -1556,30 +1753,31 @@ def api_descargar_reporte(id_orden):
     elements.append(Paragraph(f"• {orden['recomendaciones'].replace(chr(10), '<br/>')}", normal_style))
     elements.append(Paragraph("6. EVIDENCIA FOTOGRÁFICA:", title_style))
     if evidencias_db:
-        try: resample_mode = PILImage.Resampling.LANCZOS
-        except AttributeError: resample_mode = PILImage.LANCZOS
         evidencia_data, row = [], []
         for index, row_db in enumerate(evidencias_db):
             try:
                 img_data = base64.b64decode(row_db['imagen_base64'])
-                img_pil = PILImage.open(io.BytesIO(img_data))
-                if img_pil.mode in ('RGBA', 'P'): img_pil = img_pil.convert('RGB')
+                img_pil = PILImage.open(io.BytesIO(img_data)).convert('RGB')
                 w, h = img_pil.size
                 ns = min(w, h)
-                img_pil = img_pil.crop(((w-ns)/2, (h-ns)/2, (w+ns)/2, (h+ns)/2)).resize((300, 300), resample_mode)
+                img_pil = img_pil.crop(((w-ns)/2, (h-ns)/2, (w+ns)/2, (h+ns)/2)).resize((300, 300))
                 output = io.BytesIO()
                 img_pil.save(output, format='JPEG', quality=85)
                 output.seek(0)
                 row.append(Image(output, width=240, height=240))
-                if len(row) == 2: evidencia_data.append(row); row = []
+                if len(row) == 2:
+                    evidencia_data.append(row)
+                    row = []
             except: pass
-        if row: row.append(""); evidencia_data.append(row)
+        if row: 
+            row.append("")
+            evidencia_data.append(row)
         t_evidencia = Table(evidencia_data, colWidths=[255, 255])
-        t_evidencia.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('BOTTOMPADDING', (0,0), (-1,-1), 8), ('TOPPADDING', (0,0), (-1,-1), 8)]))
+        t_evidencia.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
         elements.append(t_evidencia)
     else:
         box = Table([["\n\n(Espacio reservado para adjuntar evidencia fotográfica post-impresión)\n\n"]], colWidths=[510])
-        box.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#94a3b8')), ('TEXTCOLOR', (0,0), (-1,-1), colors.HexColor('#64748b')), ('FONTNAME', (0,0), (-1,-1), 'Helvetica-Oblique')]))
+        box.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE'), ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#94a3b8'))]))
         elements.append(box)
         
     elements.append(Spacer(1, 85))
@@ -1591,8 +1789,7 @@ def api_descargar_reporte(id_orden):
     doc.build(elements)
     file_stream.seek(0)
     codigo_seguro = codigo_pdf.replace(" ", "_")
-    nombre_archivo = f"{codigo_seguro}_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf"
-    return send_file(file_stream, as_attachment=True, download_name=nombre_archivo, mimetype='application/pdf')
+    return send_file(file_stream, as_attachment=True, download_name=f"{codigo_seguro}_{orden['codigo_equipo']}_{orden['fecha_ejecucion']}.pdf", mimetype='application/pdf')
 
 if __name__ == '__main__':
     print("=====================================================")
