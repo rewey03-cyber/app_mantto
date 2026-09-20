@@ -436,6 +436,7 @@ HTML_TEMPLATE = """
         input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.3); border-color: #22d3ee; }
         input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
         input[type="number"] { -moz-appearance: textfield; }
+        /* FORZAR VISIBILIDAD DE BOTONES QUE ESTABAN OCULTOS */
         .action-btn-visible { opacity: 1 !important; visibility: visible !important; }
     </style>
 </head>
@@ -547,6 +548,7 @@ HTML_TEMPLATE = """
                         <i class="fa-solid fa-wrench text-cyan-500 mr-2"></i> Tareas Activas
                     </h3>
                     <div class="flex flex-wrap gap-2 justify-end w-full">
+                        <!-- Botón Historial regresado aquí para visibilidad inmediata -->
                         <button onclick="abrirModalHistorial()" class="bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded-lg text-[11px] font-bold transition-all shadow-sm flex items-center border border-slate-600">
                             <i class="fa-solid fa-clock-rotate-left mr-1.5"></i> Historial
                         </button>
@@ -962,6 +964,23 @@ HTML_TEMPLATE = """
                             <tr><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Fecha</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Repuesto</th><th class="px-4 py-3 text-center text-xs font-bold text-cyan-400">Cant.</th><th class="px-4 py-3 text-right text-xs font-bold text-cyan-400">Costo U.</th><th class="px-4 py-3 text-right text-xs font-bold text-cyan-400">Total</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Prov.</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Factura</th></tr>
                         </thead>
                         <tbody id="tabla-historial-compras" class="bg-white dark:bg-slate-900 divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="modal-historial" class="hidden fixed inset-0 bg-slate-950/80 overflow-y-auto h-full w-full z-50 flex justify-center items-center backdrop-blur-sm transition-opacity modal-container">
+            <div class="bg-white dark:bg-slate-900 rounded-xl shadow-2xl w-full max-w-6xl relative border border-slate-200 dark:border-slate-700 overflow-hidden flex flex-col max-h-[85vh] modal-content" onclick="event.stopPropagation()">
+                <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 bg-slate-900 flex justify-between items-center">
+                    <h2 class="text-xl font-bold text-white flex items-center"><i class="fa-solid fa-clipboard-check text-cyan-400 mr-2"></i> Historial de Auditoría</h2>
+                    <button onclick="cerrarModalHistorial()" class="text-slate-400 hover:text-white transition-colors"><i class="fa-solid fa-xmark text-2xl"></i></button>
+                </div>
+                <div class="overflow-y-auto flex-1 bg-slate-50 dark:bg-slate-900 p-4">
+                    <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
+                        <thead class="bg-slate-900 sticky top-0 z-10 border-b-2 border-cyan-500">
+                            <tr><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Fecha</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Tipo/Cod</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Equipo</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">T. Total</th><th class="px-4 py-3 text-left text-xs font-bold text-cyan-400">Técnico</th><th class="px-4 py-3 text-center text-xs font-bold text-cyan-400">Reporte</th></tr>
+                        </thead>
+                        <tbody id="tabla-historial" class="bg-white dark:bg-slate-900 divide-y divide-slate-100 dark:divide-slate-800"></tbody>
                     </table>
                 </div>
             </div>
@@ -1866,6 +1885,16 @@ def api_inventario(): return jsonify(obtener_inventario())
 @app.route('/api/compras')
 def api_compras(): return jsonify(obtener_historial_compras_db())
 
+@app.route('/api/inventario/descontar/<int:id_repuesto>', methods=['POST'])
+def api_descontar_inventario(id_repuesto):
+    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
+    descontar_stock_db(id_repuesto); return jsonify({"status": "ok"})
+
+@app.route('/api/inventario/sumar/<int:id_repuesto>', methods=['POST'])
+def api_sumar_inventario(id_repuesto):
+    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
+    sumar_stock_db(id_repuesto); return jsonify({"status": "ok"})
+
 @app.route('/api/inventario/comprar/<int:id_repuesto>', methods=['POST'])
 def api_registrar_compra(id_repuesto):
     if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
@@ -1902,6 +1931,12 @@ def api_editar_orden(id_orden):
     actualizar_orden_db(id_orden, d['id_maquina'], d['tipo_mantenimiento'], d['descripcion'], d['fecha'], d['tecnico'])
     return jsonify({"status": "ok"})
 
+@app.route('/api/ordenes/eliminar/<int:id_orden>', methods=['DELETE'])
+def api_borrar_orden(id_orden):
+    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
+    eliminar_orden_db(id_orden)
+    return jsonify({"status": "ok"})
+
 @app.route('/api/ordenes/completar/<int:id_orden>', methods=['POST'])
 def api_completar_orden(id_orden):
     d = request.json or {}
@@ -1911,6 +1946,13 @@ def api_completar_orden(id_orden):
         float(d.get('tiempo_operativo', 0.0)), float(d.get('tiempo_administrativo', 0.0)), float(d.get('tiempo_total', 0.0)),
         d.get('conclusion_final', 'OPERATIVO'), d.get('evidencias', [])
     )
+    return jsonify({"status": "ok"})
+
+@app.route('/api/maquinas/nueva', methods=['POST'])
+def api_nueva_maquina():
+    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
+    d = request.json
+    crear_maquina_db(d['codigo'], d['nombre'], d['area'], d['criticidad'])
     return jsonify({"status": "ok"})
 
 @app.route('/api/maquinas/eliminar/<int:id_maquina>', methods=['DELETE'])
@@ -1923,29 +1965,6 @@ def api_borrar_maquina(id_maquina):
     except sqlite3.IntegrityError: exito = False
     conn.close()
     return jsonify({"status": "ok"}) if exito else jsonify({"status": "error"})
-
-@app.route('/api/ordenes/eliminar/<int:id_orden>', methods=['DELETE'])
-def api_borrar_orden(id_orden):
-    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
-    eliminar_orden_db(id_orden)
-    return jsonify({"status": "ok"})
-
-@app.route('/api/maquinas/nueva', methods=['POST'])
-def api_nueva_maquina():
-    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
-    d = request.json
-    crear_maquina_db(d['codigo'], d['nombre'], d['area'], d['criticidad'])
-    return jsonify({"status": "ok"})
-
-@app.route('/api/inventario/descontar/<int:id_repuesto>', methods=['POST'])
-def api_descontar_inventario(id_repuesto):
-    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
-    descontar_stock_db(id_repuesto); return jsonify({"status": "ok"})
-
-@app.route('/api/inventario/sumar/<int:id_repuesto>', methods=['POST'])
-def api_sumar_inventario(id_repuesto):
-    if session.get('rol') != 'Admin': return jsonify({"status": "error"}), 403
-    sumar_stock_db(id_repuesto); return jsonify({"status": "ok"})
 
 @app.route('/api/reportes_generales/exportar')
 def api_exportar_reportes_generales():
